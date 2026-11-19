@@ -8,7 +8,7 @@ from pyocd.core.helpers import ConnectHelper
 
 PROBE_ID = "A1A48F062680"
 TARGET_TYPE = "stm32h503kbux"
-ELF_PATH = "/home/sun/Filelink/Firmwares/N20-Servo/firmware/target/thumbv8m.main-none-eabihf/release/n20-servo"
+ELF_PATH = "/home/sun/Filelink/Firmwares/FishyServo/firmware/target/thumbv8m.main-none-eabihf/release/n20-servo"
 
 def main():
     print("Flashing firmware with pyocd...")

@@ -55,6 +55,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "barefoc-commander"
+version = "0.1.0"
+dependencies = [
+ "barefoc",
+ "embedded-io 0.6.1",
+]
+
+[[package]]
 name = "barefoc-drivers"
 version = "0.1.0"
 dependencies = [
@@ -63,14 +71,6 @@ dependencies = [
  "embedded-io 0.6.1",
  "libm",
  "nb 1.1.0",
-]
-
-[[package]]
-name = "barefoc-kinematics"
-version = "0.1.0"
-dependencies = [
- "barefoc",
- "libm",
 ]
 
 [[package]]
@@ -597,6 +597,7 @@ name = "n20-servo"
 version = "0.1.0"
 dependencies = [
  "barefoc",
+ "barefoc-commander",
  "barefoc-drivers",
  "barefoc-multibus",
  "barefoc-stm32",
@@ -858,7 +859,6 @@ name = "tmag-rs"
 version = "0.1.0"
 dependencies = [
  "barefoc",
- "barefoc-kinematics",
  "embedded-hal 1.0.0",
  "libm",
 ]

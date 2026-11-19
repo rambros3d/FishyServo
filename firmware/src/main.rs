@@ -2,28 +2,38 @@
 #![no_main]
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use barefoc::common::filter::LowPassFilter;
 use barefoc::common::time::Clock;
+use barefoc::kinematics::{ActuatorAssembly, MotorControl, TopologyPreset};
 use barefoc::motor::enums::{MotionControlType, TorqueControlType};
 use barefoc::traits::adc::AdcPin;
-use barefoc::traits::sensor::{Direction, Sensor};
+use barefoc::traits::sensor::{Direction, Sensor, SensorBase};
+use barefoc_commander::kinematics::{Commander4Axis, KinematicsCommander};
 use barefoc_drivers::comms::registers::{RegisterError, RegisterId, RegisterValue};
 use barefoc_drivers::comms::RegisterBridge;
-use barefoc_drivers::dc::traits::DCDriver;
-use barefoc_drivers::dc::{CurrentMirrorSense, DCDriver2PWM, DCMotor};
+use barefoc_drivers::dc::traits::{DCDriver, DCDriverParams};
+use barefoc_drivers::dc::{CurrentMirrorSense, DCDriver2PWM, DCMotor, DummySensor};
+use barefoc_multibus::profile::{
+    multi_motor_profile, refresh_telemetry_multi, MultiMotorState,
+};
+use barefoc_multibus::table::{HookResult, RegEntry};
 use barefoc_multibus::transport::RegServer;
 use barefoc_stm32::bus_target_i2c::{ServiceOutcome, Stm32I2cTarget};
+
 use embassy_executor::{InterruptExecutor, Spawner};
-use embassy_stm32::interrupt;
-use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::adc::{Adc, SampleTime};
 use embassy_stm32::gpio::{Level, Output, OutputType, Speed};
 use embassy_stm32::i2c::{Config as I2cConfig, I2c, Master};
+use embassy_stm32::interrupt;
+use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::mode::Blocking;
-use embassy_stm32::peripherals::{ADC1, I2C2, PA5, TIM1, TIM3};
+use embassy_stm32::peripherals::{ADC1, I2C2, PA2, PA3, PA4, PA5, TIM1, TIM3};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::low_level::CountingMode;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm, SimplePwmChannel};
+use embassy_stm32::usart::{Config as UartConfig, Uart};
 use embassy_stm32::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -32,9 +42,11 @@ use panic_rtt_target as _;
 use rtt_target::{rprintln, DownChannel};
 use tmag_rs::barefoc::Tmag5273Sensor;
 use tmag_rs::{AngleEnable, DeviceVariant, MagneticChannel, OperatingMode, Tmag5273};
-use core::sync::atomic::{AtomicBool, Ordering};
 
 static TMAG_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Custom register offset for runtime topology switching over MultiBus.
+pub const REG_TOPOLOGY_MODE: u8 = 0x78;
 
 // ---------------------------------------------------------------------------
 // System Clock implementing barefoc::common::time::Clock via Embassy Instant
@@ -55,37 +67,191 @@ impl Clock for EmbassyClock {
 static CLOCK: EmbassyClock = EmbassyClock;
 
 // ---------------------------------------------------------------------------
-// ADC1 PA5 Pin adapter implementing barefoc::traits::adc::AdcPin
+// ADC1 Channel Multiplexer & AdcPin Adapter
 // ---------------------------------------------------------------------------
-pub struct Stm32AdcPa5<'d> {
-    adc: Adc<'d, ADC1, Blocking>,
-    pin: Peri<'d, PA5>,
+static GLOBAL_ADC: Mutex<CriticalSectionRawMutex, RefCell<Option<Adc<'static, ADC1, Blocking>>>> =
+    Mutex::new(RefCell::new(None));
+
+pub enum AdcInputPin {
+    ChA(Peri<'static, PA2>),
+    ChB(Peri<'static, PA3>),
+    ChC(Peri<'static, PA4>),
+    ChD(Peri<'static, PA5>),
+}
+
+pub struct Stm32AdcPin {
+    pin: AdcInputPin,
     sample_time: SampleTime,
 }
 
-impl<'d> Stm32AdcPa5<'d> {
-    pub fn new(adc: Adc<'d, ADC1, Blocking>, pin: Peri<'d, PA5>, sample_time: SampleTime) -> Self {
-        Self {
-            adc,
-            pin,
-            sample_time,
-        }
+impl Stm32AdcPin {
+    pub fn new(pin: AdcInputPin, sample_time: SampleTime) -> Self {
+        Self { pin, sample_time }
     }
 }
 
-impl<'d> AdcPin for Stm32AdcPa5<'d> {
+impl AdcPin for Stm32AdcPin {
     fn read(&mut self) -> u16 {
         let mut sum: u32 = 0;
         const SAMPLES: u32 = 8;
-        for _ in 0..SAMPLES {
-            sum += self.adc.blocking_read(&mut self.pin, self.sample_time) as u32;
-        }
+        GLOBAL_ADC.lock(|cell| {
+            if let Some(ref mut adc) = *cell.borrow_mut() {
+                for _ in 0..SAMPLES {
+                    let val = match &mut self.pin {
+                        AdcInputPin::ChA(pin) => adc.blocking_read(pin, self.sample_time),
+                        AdcInputPin::ChB(pin) => adc.blocking_read(pin, self.sample_time),
+                        AdcInputPin::ChC(pin) => adc.blocking_read(pin, self.sample_time),
+                        AdcInputPin::ChD(pin) => adc.blocking_read(pin, self.sample_time),
+                    };
+                    sum += val as u32;
+                }
+            }
+        });
         (sum / SAMPLES) as u16
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shared Servo State and Register Bridge
+// Bridge A Sign-Magnitude H-Bridge Driver (PA15 DIR, PB5 PWM on TIM1_CH3)
+// ---------------------------------------------------------------------------
+pub struct BridgeADriver {
+    params: DCDriverParams,
+    dir_pin: Output<'static>,
+    pwm_ch: SimplePwmChannel<'static, TIM1>,
+}
+
+impl BridgeADriver {
+    pub fn new(dir_pin: Output<'static>, pwm_ch: SimplePwmChannel<'static, TIM1>) -> Self {
+        Self {
+            params: DCDriverParams::new(),
+            dir_pin,
+            pwm_ch,
+        }
+    }
+}
+
+impl DCDriver for BridgeADriver {
+    fn init(&mut self) -> Result<(), ()> {
+        self.params.initialized = true;
+        if self.params.voltage_power_supply > 0.0 && self.params.voltage_limit > self.params.voltage_power_supply {
+            self.params.voltage_limit = self.params.voltage_power_supply;
+        }
+        self.dir_pin.set_low();
+        self.pwm_ch.set_duty_cycle(0);
+        Ok(())
+    }
+
+    fn enable(&mut self) {}
+
+    fn disable(&mut self) {
+        self.set_pwm(0.0);
+    }
+
+    fn set_pwm(&mut self, voltage: f32) {
+        let v_limit = self.params.voltage_limit;
+        let v_supply = if self.params.voltage_power_supply > 0.0 {
+            self.params.voltage_power_supply
+        } else {
+            1.0
+        };
+        let max_duty = self.pwm_ch.max_duty_cycle() as f32;
+
+        if voltage > 0.0 {
+            let u = if voltage > v_limit { v_limit } else { voltage };
+            let duty_fraction = (u / v_supply).clamp(0.0, 1.0);
+            self.dir_pin.set_high();
+            let duty = ((1.0 - duty_fraction) * max_duty) as u32;
+            self.pwm_ch.set_duty_cycle(duty);
+        } else if voltage < 0.0 {
+            let abs_v = -voltage;
+            let u = if abs_v > v_limit { v_limit } else { abs_v };
+            let duty_fraction = (u / v_supply).clamp(0.0, 1.0);
+            self.dir_pin.set_low();
+            let duty = (duty_fraction * max_duty) as u32;
+            self.pwm_ch.set_duty_cycle(duty);
+        } else {
+            self.dir_pin.set_low();
+            self.pwm_ch.set_duty_cycle(0);
+        }
+    }
+
+    fn params(&self) -> &DCDriverParams {
+        &self.params
+    }
+
+    fn params_mut(&mut self) -> &mut DCDriverParams {
+        &mut self.params
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quad H-Bridge Unified DCDriver Enum
+// ---------------------------------------------------------------------------
+pub enum QuadDCDriver {
+    A(BridgeADriver),
+    B(DCDriver2PWM<SimplePwmChannel<'static, TIM1>, SimplePwmChannel<'static, TIM3>>),
+    C(DCDriver2PWM<SimplePwmChannel<'static, TIM3>, SimplePwmChannel<'static, TIM3>>),
+    D(DCDriver2PWM<SimplePwmChannel<'static, TIM1>, SimplePwmChannel<'static, TIM3>>),
+}
+
+impl DCDriver for QuadDCDriver {
+    fn init(&mut self) -> Result<(), ()> {
+        match self {
+            Self::A(d) => d.init(),
+            Self::B(d) => d.init(),
+            Self::C(d) => d.init(),
+            Self::D(d) => d.init(),
+        }
+    }
+
+    fn enable(&mut self) {
+        match self {
+            Self::A(d) => d.enable(),
+            Self::B(d) => d.enable(),
+            Self::C(d) => d.enable(),
+            Self::D(d) => d.enable(),
+        }
+    }
+
+    fn disable(&mut self) {
+        match self {
+            Self::A(d) => d.disable(),
+            Self::B(d) => d.disable(),
+            Self::C(d) => d.disable(),
+            Self::D(d) => d.disable(),
+        }
+    }
+
+    fn set_pwm(&mut self, voltage: f32) {
+        match self {
+            Self::A(d) => d.set_pwm(voltage),
+            Self::B(d) => d.set_pwm(voltage),
+            Self::C(d) => d.set_pwm(voltage),
+            Self::D(d) => d.set_pwm(voltage),
+        }
+    }
+
+    fn params(&self) -> &DCDriverParams {
+        match self {
+            Self::A(d) => d.params(),
+            Self::B(d) => d.params(),
+            Self::C(d) => d.params(),
+            Self::D(d) => d.params(),
+        }
+    }
+
+    fn params_mut(&mut self) -> &mut DCDriverParams {
+        match self {
+            Self::A(d) => d.params_mut(),
+            Self::B(d) => d.params_mut(),
+            Self::C(d) => d.params_mut(),
+            Self::D(d) => d.params_mut(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared Motor State & MultiBus Register Bridge
 // ---------------------------------------------------------------------------
 #[derive(Clone, Copy)]
 pub struct SharedServoState {
@@ -193,9 +359,36 @@ impl RegisterBridge for SharedServoState {
     }
 }
 
-// Global thread-safe shared state between motor_task and i2c_target_task
-static SHARED_SERVO: Mutex<CriticalSectionRawMutex, RefCell<SharedServoState>> =
-    Mutex::new(RefCell::new(SharedServoState::new()));
+// ---------------------------------------------------------------------------
+// Quad Multi-Motor Shared State
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy)]
+pub struct SharedQuadState {
+    pub motors: [SharedServoState; 4],
+    pub topology_mode: u8,
+    pub sensor_map: [u8; 4],
+    pub joint_targets: [f32; 4],
+    pub joint_angles: [f32; 4],
+    pub joint_velocities: [f32; 4],
+    pub selected_motor: u8,
+}
+
+impl SharedQuadState {
+    pub const fn new() -> Self {
+        Self {
+            motors: [SharedServoState::new(); 4],
+            topology_mode: 0, // Four1Dof
+            sensor_map: [0, 1, 2, 3],
+            joint_targets: [0.0; 4],
+            joint_angles: [0.0; 4],
+            joint_velocities: [0.0; 4],
+            selected_motor: 0,
+        }
+    }
+}
+
+static SHARED_QUAD: Mutex<CriticalSectionRawMutex, RefCell<SharedQuadState>> =
+    Mutex::new(RefCell::new(SharedQuadState::new()));
 
 // ---------------------------------------------------------------------------
 // Concrete Type Aliases & Unified Sensor Enum
@@ -203,329 +396,233 @@ static SHARED_SERVO: Mutex<CriticalSectionRawMutex, RefCell<SharedServoState>> =
 #[allow(dead_code)]
 pub enum N20Sensor<I2C: embedded_hal::i2c::I2c> {
     Tmag(Tmag5273Sensor<I2C>),
-    Fallback(barefoc_drivers::dc::DummySensor<EmbassyClock>),
+    Fallback(DummySensor<EmbassyClock>),
 }
 
-impl<I2C: embedded_hal::i2c::I2c> barefoc::traits::sensor::Sensor<EmbassyClock> for N20Sensor<I2C> {
-    fn base(&self) -> &barefoc::traits::sensor::SensorBase {
+impl<I2C: embedded_hal::i2c::I2c> Sensor<EmbassyClock> for N20Sensor<I2C> {
+    fn base(&self) -> &SensorBase {
         match self {
-            Self::Tmag(s) => <Tmag5273Sensor<I2C> as barefoc::traits::sensor::Sensor<EmbassyClock>>::base(s),
-            Self::Fallback(s) => <barefoc_drivers::dc::DummySensor<EmbassyClock> as barefoc::traits::sensor::Sensor<EmbassyClock>>::base(s),
+            Self::Tmag(s) => <Tmag5273Sensor<I2C> as Sensor<EmbassyClock>>::base(s),
+            Self::Fallback(s) => <DummySensor<EmbassyClock> as Sensor<EmbassyClock>>::base(s),
         }
     }
 
-    fn base_mut(&mut self) -> &mut barefoc::traits::sensor::SensorBase {
+    fn base_mut(&mut self) -> &mut SensorBase {
         match self {
-            Self::Tmag(s) => <Tmag5273Sensor<I2C> as barefoc::traits::sensor::Sensor<EmbassyClock>>::base_mut(s),
-            Self::Fallback(s) => <barefoc_drivers::dc::DummySensor<EmbassyClock> as barefoc::traits::sensor::Sensor<EmbassyClock>>::base_mut(s),
+            Self::Tmag(s) => <Tmag5273Sensor<I2C> as Sensor<EmbassyClock>>::base_mut(s),
+            Self::Fallback(s) => <DummySensor<EmbassyClock> as Sensor<EmbassyClock>>::base_mut(s),
         }
     }
 
     fn get_sensor_angle(&self) -> f32 {
         match self {
-            Self::Tmag(s) => <Tmag5273Sensor<I2C> as barefoc::traits::sensor::Sensor<EmbassyClock>>::get_sensor_angle(s),
-            Self::Fallback(s) => <barefoc_drivers::dc::DummySensor<EmbassyClock> as barefoc::traits::sensor::Sensor<EmbassyClock>>::get_sensor_angle(s),
+            Self::Tmag(s) => <Tmag5273Sensor<I2C> as Sensor<EmbassyClock>>::get_sensor_angle(s),
+            Self::Fallback(s) => <DummySensor<EmbassyClock> as Sensor<EmbassyClock>>::get_sensor_angle(s),
         }
     }
 }
 
-type MotorDriverType = DCDriver2PWM<
-    SimplePwmChannel<'static, TIM1>,
-    SimplePwmChannel<'static, TIM3>,
->;
-
 type MotorSensorType = N20Sensor<I2c<'static, Blocking, Master>>;
-
-type MotorCurrentSenseType = CurrentMirrorSense<Stm32AdcPa5<'static>, EmbassyClock>;
-
-type DCMotorType = DCMotor<
-    'static,
-    MotorSensorType,
-    MotorDriverType,
-    MotorCurrentSenseType,
-    EmbassyClock,
->;
+type MotorCurrentSenseType = CurrentMirrorSense<Stm32AdcPin, EmbassyClock>;
+type DCMotorType = DCMotor<'static, MotorSensorType, QuadDCDriver, MotorCurrentSenseType, EmbassyClock>;
 
 // ---------------------------------------------------------------------------
-// 1 kHz Motor Control Task
+// Assembly Motor Adapter implementing MotorControl
 // ---------------------------------------------------------------------------
-#[derive(PartialEq, Clone, Copy)]
-enum HomingPhase {
-    Idle,
-    DriveFwd { step: u32, over_cnt: u32 },
-    RelaxFwd { step: u32 },
-    DriveRev { step: u32, over_cnt: u32 },
-    Done,
+pub struct AssemblyDCMotor<'a>(pub &'a mut DCMotorType);
+
+impl<'a> MotorControl<EmbassyClock> for AssemblyDCMotor<'a> {
+    fn shaft_angle(&self) -> f32 {
+        self.0.shaft_angle()
+    }
+
+    fn shaft_velocity(&mut self) -> f32 {
+        self.0.shaft_velocity()
+    }
+
+    fn velocity_limit(&self) -> f32 {
+        self.0.velocity_limit
+    }
+
+    fn move_motor(&mut self, target: f32, _clock: &EmbassyClock) {
+        self.0.move_motor(target);
+    }
+
+    fn loop_foc(&mut self, _clock: &EmbassyClock) {}
 }
 
+// ---------------------------------------------------------------------------
+// 1 kHz Quad Motor Control & Kinematics Task
+// ---------------------------------------------------------------------------
 #[embassy_executor::task]
 async fn motor_task(
-    mut motor: DCMotorType,
+    mut motors: [DCMotorType; 4],
     mut led_b: Output<'static>,
     mut led_r: Output<'static>,
     has_sensor: bool,
     mut down: DownChannel,
+    mut uart: Option<Uart<'static, Blocking>>,
 ) {
     TMAG_DETECTED.store(has_sensor, Ordering::Relaxed);
     let mut ticker = Ticker::every(Duration::from_millis(1));
-    let mut last_target = 0.0f32;
     let mut loop_count: u32 = 0;
 
-    let mut homing = HomingPhase::Idle;
-    let mut fwd_stop_angle = 0.0f32;
-    let mut rev_stop_angle = 0.0f32;
-    let mut fwd_stall_ma = 0.0f32;
-    let mut rev_stall_ma = 0.0f32;
-    let mut fwd_duration_ms: u32 = 0;
-    let mut rev_duration_ms: u32 = 0;
-    let mut peak_ma_fwd = 0.0f32;
-    let mut peak_ma_rev = 0.0f32;
-    let mut run_ma_fwd = 0.0f32;
-    let mut run_ma_rev = 0.0f32;
-    let mut last_current_ma = 0.0f32;
-    let mut current_shaft_angle = 0.0f32;
-    let mut lpf_current = LowPassFilter::new(0.015, 0.001, &CLOCK);
+    let mut assembly = ActuatorAssembly::<4, 4>::new().with_downsample(10);
+    assembly.set_topology(TopologyPreset::Four1Dof);
+
+    let mut lpf_currents = [
+        LowPassFilter::new(0.015, 0.001, &CLOCK),
+        LowPassFilter::new(0.015, 0.001, &CLOCK),
+        LowPassFilter::new(0.015, 0.001, &CLOCK),
+        LowPassFilter::new(0.015, 0.001, &CLOCK),
+    ];
+
+    let mut commander4 = Commander4Axis::new_with_clock(&CLOCK);
 
     let mut rtt_buf = [0u8; 64];
     let mut rtt_line: heapless::Vec<u8, 64> = heapless::Vec::new();
 
-    rprintln!("Motor task started at 1 kHz with integrated RTT console.");
+    rprintln!("Quad motor task started at 1 kHz with multi-topology kinematics.");
 
     loop {
         ticker.next().await;
         loop_count = loop_count.wrapping_add(1);
 
-        // 1. Fetch updated target & tuning from shared state
-        let (target, enabled, p_ang, vel_p, vel_i, vel_d, v_lim, vel_lim, mode, home_req, home_v, stall_thresh) =
-            SHARED_SERVO.lock(|s| {
-                let s = s.borrow();
-                (
-                    s.target,
-                    s.enabled,
-                    s.p_angle,
-                    s.pid_vel_p,
-                    s.pid_vel_i,
-                    s.pid_vel_d,
-                    s.voltage_limit,
-                    s.velocity_limit,
-                    s.controller_mode,
-                    s.homing_requested,
-                    s.homing_voltage,
-                    s.stall_threshold_ma,
-                )
-            });
-
-        // 2. Trigger homing if requested
-        if home_req && homing == HomingPhase::Idle {
-            homing = HomingPhase::DriveFwd { step: 0, over_cnt: 0 };
-            peak_ma_fwd = 0.0;
-            peak_ma_rev = 0.0;
-            run_ma_fwd = 0.0;
-            run_ma_rev = 0.0;
-            SHARED_SERVO.lock(|s| {
-                let mut s = s.borrow_mut();
-                s.homing_requested = false;
-                s.enabled = true;
-            });
-            motor.enable();
-            motor.controller = MotionControlType::torque;
-            rprintln!("Starting stall-detection endpoint homing (V={:.2}V, stall_thresh={:.1}mA)...", home_v, stall_thresh);
-        }
-
-        // 3. Apply dynamic parameter changes
-        if (target - last_target).abs() > 1e-6 {
-            motor.target = target;
-            last_target = target;
-        }
-
-        if enabled && motor.enabled == 0 {
-            motor.enable();
-        } else if !enabled && motor.enabled != 0 && homing == HomingPhase::Idle {
-            motor.disable();
-        }
-
-        motor.voltage_limit = v_lim;
-        motor.velocity_limit = vel_lim;
-        motor.P_angle.set_p(p_ang);
-        motor.PID_velocity.set_p(vel_p);
-        motor.PID_velocity.set_i(vel_i);
-        motor.PID_velocity.set_d(vel_d);
-
-        match mode {
-            0 => motor.controller = MotionControlType::angle,
-            1 => motor.controller = MotionControlType::velocity_openloop,
-            2 => motor.controller = MotionControlType::torque,
-            _ => {}
-        }
-
-        // 4. Homing state machine
-        let effective_target = match homing {
-            HomingPhase::Idle => target,
-            HomingPhase::DriveFwd { ref mut step, ref mut over_cnt } => {
-                *step += 1;
-                motor.controller = MotionControlType::torque;
-                // Timeout after 15 seconds to allow full stroke travel
-                if *step > 15000 {
-                    rprintln!("Homing FWD timeout (15s). Halting.");
-                    homing = HomingPhase::Idle;
-                    0.0
-                } else {
-                    if *step > 150 {
-                        if *step < 450 {
-                            if run_ma_fwd == 0.0 {
-                                run_ma_fwd = last_current_ma;
-                            } else {
-                                run_ma_fwd += (last_current_ma - run_ma_fwd) * 0.05;
-                            }
-                        }
-                        if last_current_ma > peak_ma_fwd {
-                            peak_ma_fwd = last_current_ma;
-                        }
-                    }
-                    let is_stall = (last_current_ma > stall_thresh)
-                        || (*step > 350 && run_ma_fwd > 5.0 && last_current_ma > run_ma_fwd + 40.0 && last_current_ma > 60.0);
-
-                    if *step > 150 && is_stall {
-                        *over_cnt += 1;
-                        if *over_cnt >= 20 {
-                            fwd_stop_angle = if let Some(s) = motor.sensor() { s.get_angle() } else { current_shaft_angle };
-                            fwd_stall_ma = last_current_ma;
-                            fwd_duration_ms = *step;
-                            rprintln!(
-                                "-> Forward hard stop detected! I={:.1} mA (peak={:.1} mA, run={:.1} mA) at {} ms (raw={:.3} rad)",
-                                last_current_ma, peak_ma_fwd, run_ma_fwd, *step, fwd_stop_angle
-                            );
-                            homing = HomingPhase::RelaxFwd { step: 0 };
-                        }
-                    } else {
-                        *over_cnt = over_cnt.saturating_sub(1);
-                    }
-                    home_v
-                }
-            }
-            HomingPhase::RelaxFwd { ref mut step } => {
-                *step += 1;
-                motor.controller = MotionControlType::torque;
-                if *step >= 250 {
-                    homing = HomingPhase::DriveRev { step: 0, over_cnt: 0 };
-                }
-                0.0
-            }
-            HomingPhase::DriveRev { ref mut step, ref mut over_cnt } => {
-                *step += 1;
-                motor.controller = MotionControlType::torque;
-                if *step > 15000 {
-                    rprintln!("Homing REV timeout (15s). Halting.");
-                    homing = HomingPhase::Idle;
-                    0.0
-                } else {
-                    if *step > 150 {
-                        if *step < 450 {
-                            if run_ma_rev == 0.0 {
-                                run_ma_rev = last_current_ma;
-                            } else {
-                                run_ma_rev += (last_current_ma - run_ma_rev) * 0.05;
-                            }
-                        }
-                        if last_current_ma > peak_ma_rev {
-                            peak_ma_rev = last_current_ma;
-                        }
-                    }
-                    let is_stall = (last_current_ma > stall_thresh)
-                        || (*step > 350 && run_ma_rev > 5.0 && last_current_ma > run_ma_rev + 40.0 && last_current_ma > 60.0);
-
-                    if *step > 150 && is_stall {
-                        *over_cnt += 1;
-                        if *over_cnt >= 20 {
-                            rev_stop_angle = if let Some(s) = motor.sensor() { s.get_angle() } else { current_shaft_angle };
-                            rev_stall_ma = last_current_ma;
-                            rev_duration_ms = *step;
-                            rprintln!(
-                                "-> Reverse hard stop detected! I={:.1} mA (peak={:.1} mA, run={:.1} mA) at {} ms (raw={:.3} rad)",
-                                last_current_ma, peak_ma_rev, run_ma_rev, *step, rev_stop_angle
-                            );
-                            homing = HomingPhase::Done;
-                        }
-                    } else {
-                        *over_cnt = over_cnt.saturating_sub(1);
-                    }
-                    -home_v
-                }
-            }
-            HomingPhase::Done => {
-                let center_raw = (fwd_stop_angle + rev_stop_angle) * 0.5;
-                motor.sensor_offset = -center_raw;
-                motor.controller = MotionControlType::angle;
-                rprintln!("=======================================================");
-                rprintln!("     OPEN-LOOP STALL HOMING + TMAG ANGLE RANGE REPORT  ");
-                rprintln!("=======================================================");
-                let fwd_deg = fwd_stop_angle * 180.0 / core::f32::consts::PI;
-                let rev_deg = rev_stop_angle * 180.0 / core::f32::consts::PI;
-                let stroke = (fwd_stop_angle - rev_stop_angle).abs();
-                let stroke_deg = stroke * 180.0 / core::f32::consts::PI;
-                rprintln!("  Forward Stop (raw):  {:.3} rad ({:.1}°), I_stall={:.1} mA, travel={} ms",
-                    fwd_stop_angle, fwd_deg, fwd_stall_ma, fwd_duration_ms);
-                rprintln!("  Reverse Stop (raw):  {:.3} rad ({:.1}°), I_stall={:.1} mA, travel={} ms",
-                    rev_stop_angle, rev_deg, rev_stall_ma, rev_duration_ms);
-                rprintln!("  Auto-Calibrated Center: {:.3} rad (zero reference)", center_raw);
-                rprintln!("  Total Stroke Range:  {:.3} rad ({:.1}°)", stroke, stroke_deg);
-                rprintln!("  Switching to Closed-Loop [ANG] holding at 0.0 rad (center)...");
-                rprintln!("=======================================================");
-                homing = HomingPhase::Idle;
-                SHARED_SERVO.lock(|s| {
-                    let mut s = s.borrow_mut();
-                    s.controller_mode = 0; // Angle mode
-                    s.target = 0.0;
-                    s.enabled = true; // active closed-loop holding
-                });
-                motor.enable();
-                0.0
-            }
-        };
-
-        // 5. Step closed-loop servo control loop
-        motor.move_motor(effective_target);
-
-        // 6. Publish real-time telemetry back to shared state
-        let shaft_angle = motor.shaft_angle();
-        let shaft_velocity = motor.shaft_velocity();
-        current_shaft_angle = shaft_angle;
-        let current_ma_raw = motor
-            .current_sense_mut()
-            .map(|cs| cs.get_current_magnitude() * 1000.0)
-            .unwrap_or(0.0);
-        let current_ma = lpf_current.update(current_ma_raw, &CLOCK);
-        last_current_ma = current_ma;
-        let status = motor.motor_status as u8;
-
-        // Emergency overcurrent trip (> 600 mA)
-        if current_ma > 600.0 && motor.enabled != 0 {
-            rprintln!("EMERGENCY OVERCURRENT TRIP! I={:.1} mA > 600 mA. Bridge disabled.", current_ma);
-            motor.disable();
-            SHARED_SERVO.lock(|s| {
-                let mut s = s.borrow_mut();
-                s.enabled = false;
-                s.target = 0.0;
-            });
-            homing = HomingPhase::Idle;
-        }
-
-        SHARED_SERVO.lock(|s| {
-            let mut s = s.borrow_mut();
-            s.current_angle = shaft_angle;
-            s.current_velocity = shaft_velocity;
-            s.current_ma = current_ma;
-            s.status = status;
+        // 1. Fetch updated state & topology from SHARED_QUAD
+        let (topology_mode, sensor_map, joint_targets, motor_states) = SHARED_QUAD.lock(|s| {
+            let s = s.borrow();
+            (s.topology_mode, s.sensor_map, s.joint_targets, s.motors)
         });
 
-        // 7. Service RTT interactive console commands (every 10 ms = 100 Hz)
+        // 2. Check for dynamic topology changes
+        let current_preset = assembly.topology();
+        let target_preset = TopologyPreset::from_u8(topology_mode);
+        if current_preset != target_preset {
+            assembly.set_topology(target_preset);
+            rprintln!("Dynamic topology switched to {:?} (mode={})", target_preset, topology_mode);
+        }
+
+        // 3. Apply motor parameters & targets
+        for i in 0..4 {
+            let s = &motor_states[i];
+            let mot = &mut motors[i];
+
+            if s.enabled && mot.enabled == 0 {
+                mot.enable();
+            } else if !s.enabled && mot.enabled != 0 {
+                mot.disable();
+            }
+
+            mot.voltage_limit = s.voltage_limit;
+            mot.velocity_limit = s.velocity_limit;
+            mot.P_angle.set_p(s.p_angle);
+            mot.PID_velocity.set_p(s.pid_vel_p);
+            mot.PID_velocity.set_i(s.pid_vel_i);
+            mot.PID_velocity.set_d(s.pid_vel_d);
+
+            match s.controller_mode {
+                0 => mot.controller = MotionControlType::angle,
+                1 => mot.controller = MotionControlType::velocity_openloop,
+                2 => mot.controller = MotionControlType::torque,
+                _ => {}
+            }
+
+            assembly.set_joint_target(i, joint_targets[i]);
+            assembly.set_sensor_mapping(i, sensor_map[i] as usize);
+        }
+
+        // 4. Update sensor channel feedback in assembly pool
+        for i in 0..4 {
+            let (angle, vel) = if let Some(s) = motors[i].sensor_mut() {
+                (s.get_angle(), s.get_velocity())
+            } else {
+                (0.0, 0.0)
+            };
+            assembly.set_sensor_state(i, angle, vel);
+        }
+
+        // 5. Execute 1 kHz actuator assembly control loops
+        {
+            let (m0, rest) = motors.split_at_mut(1);
+            let (m1, rest) = rest.split_at_mut(1);
+            let (m2, m3) = rest.split_at_mut(1);
+
+            let mut wrapped = [
+                AssemblyDCMotor(&mut m0[0]),
+                AssemblyDCMotor(&mut m1[0]),
+                AssemblyDCMotor(&mut m2[0]),
+                AssemblyDCMotor(&mut m3[0]),
+            ];
+
+            if assembly.topology() == TopologyPreset::Four1Dof {
+                // In independent 1-DOF mode, drive motors directly from target setpoints
+                for i in 0..4 {
+                    let tgt = if motor_states[i].controller_mode == 0 && joint_targets[i] != 0.0 {
+                        joint_targets[i]
+                    } else {
+                        motor_states[i].target
+                    };
+                    wrapped[i].move_motor(tgt, &CLOCK);
+                }
+            } else {
+                // In coupled 2-DOF or mixed topologies, execute outer joint kinematics
+                assembly.step_motors(&mut wrapped, &CLOCK);
+            }
+        }
+
+        // 6. Current sensing, emergency trips & telemetry publish
+        let mut measured_currents = [0.0f32; 4];
+        let mut shaft_angles = [0.0f32; 4];
+        let mut shaft_vels = [0.0f32; 4];
+        let mut statuses = [0u8; 4];
+
+        for i in 0..4 {
+            let shaft_ang = motors[i].shaft_angle();
+            let shaft_vel = motors[i].shaft_velocity();
+            let raw_ma = motors[i]
+                .current_sense_mut()
+                .map(|cs| cs.get_current_magnitude() * 1000.0)
+                .unwrap_or(0.0);
+            let cur_ma = lpf_currents[i].update(raw_ma, &CLOCK);
+            let stat = motors[i].motor_status as u8;
+
+            // Emergency trip (> 600 mA)
+            if cur_ma > 600.0 && motors[i].enabled != 0 {
+                rprintln!("EMERGENCY OVERCURRENT TRIP ON MOTOR {}! I={:.1} mA > 600 mA. Disabled.", i, cur_ma);
+                motors[i].disable();
+                SHARED_QUAD.lock(|sq| {
+                    sq.borrow_mut().motors[i].enabled = false;
+                });
+            }
+
+            measured_currents[i] = cur_ma;
+            shaft_angles[i] = shaft_ang;
+            shaft_vels[i] = shaft_vel;
+            statuses[i] = stat;
+        }
+
+        // Publish back to SHARED_QUAD
+        SHARED_QUAD.lock(|sq| {
+            let mut sq = sq.borrow_mut();
+            for i in 0..4 {
+                sq.motors[i].current_angle = shaft_angles[i];
+                sq.motors[i].current_velocity = shaft_vels[i];
+                sq.motors[i].current_ma = measured_currents[i];
+                sq.motors[i].status = statuses[i];
+                sq.joint_angles[i] = assembly.joint_angle(i);
+                sq.joint_velocities[i] = assembly.joint_velocity(i);
+            }
+        });
+
+        // 7. Service RTT & USART1 Commander commands (every 10 ms = 100 Hz)
         if loop_count % 10 == 0 {
+            // Read RTT DownChannel
             let count = down.read(&mut rtt_buf);
             for &b in &rtt_buf[..count] {
                 if b == b'\r' || b == b'\n' {
                     if !rtt_line.is_empty() {
                         if let Ok(cmd_str) = core::str::from_utf8(&rtt_line) {
-                            handle_rtt_command(cmd_str.trim());
+                            handle_unified_command(cmd_str.trim(), &mut commander4, &mut assembly);
                         }
                         rtt_line.clear();
                     }
@@ -533,231 +630,203 @@ async fn motor_task(
                     rtt_line.clear();
                 }
             }
+
+            // Read USART1 non-blocking if present
+            if let Some(ref mut _u) = uart {
+                let regs = embassy_stm32::pac::USART1;
+                while regs.isr().read().rxne() {
+                    let b = (regs.rdr().read().dr() & 0xFF) as u8;
+                    if b == b'\r' || b == b'\n' {
+                        if !rtt_line.is_empty() {
+                            if let Ok(cmd_str) = core::str::from_utf8(&rtt_line) {
+                                handle_unified_command(cmd_str.trim(), &mut commander4, &mut assembly);
+                            }
+                            rtt_line.clear();
+                        }
+                    } else if rtt_line.push(b).is_err() {
+                        rtt_line.clear();
+                    }
+                }
+            }
         }
 
-        // 8. Periodic RTT Telemetry & LED Status (2 Hz idle, 10 Hz moving/homing)
-        let log_interval = if homing != HomingPhase::Idle || motor.enabled != 0 { 100 } else { 500 };
+        // 8. Periodic telemetry & LED Status (2 Hz idle, 10 Hz active)
+        let any_enabled = motors.iter().any(|m| m.enabled != 0);
+        let log_interval = if any_enabled { 100 } else { 500 };
         if loop_count % log_interval == 0 {
             if TMAG_DETECTED.load(Ordering::Relaxed) {
-                // TMAG sensor detected: stop blinking (steady Blue ON, Red OFF)
                 led_b.set_low();
                 led_r.set_high();
             } else {
-                // TMAG sensor missing: blink Red (open-loop fallback warning)
                 led_r.toggle();
                 led_b.set_high();
             }
 
-            let deg = shaft_angle * 180.0 / core::f32::consts::PI;
-            let tgt_deg = effective_target * 180.0 / core::f32::consts::PI;
-            let mode_str = if homing != HomingPhase::Idle {
-                "HOMING"
-            } else {
-                match motor.controller {
-                    MotionControlType::angle => "ANG",
-                    MotionControlType::velocity_openloop => "VEL_OL",
-                    MotionControlType::velocity => "VEL",
-                    MotionControlType::torque => "VOLT",
-                    _ => "OTHER",
-                }
+            let sel = SHARED_QUAD.lock(|s| s.borrow().selected_motor) as usize;
+            let topo_name = match assembly.topology() {
+                TopologyPreset::Four1Dof => "4x1-DOF",
+                TopologyPreset::Two2Dof => "2x2-DOF",
+                TopologyPreset::One1DofOne2Dof => "1x1-DOF+1x2-DOF",
+                TopologyPreset::Two1DofOne2Dof => "2x1-DOF+1x2-DOF",
+                TopologyPreset::Custom => "Custom",
             };
+
             rprintln!(
-                "[{}] tgt={:.2} ({:.1}°) | ang={:.2} ({:.1}°) | vel={:.1} rad/s | I={:.1} mA | en={}",
-                mode_str,
-                effective_target,
-                tgt_deg,
-                shaft_angle,
-                deg,
-                shaft_velocity,
-                current_ma,
-                if motor.enabled != 0 { 1 } else { 0 }
+                "[{}] Mot {}: tgt={:.2} | ang={:.2} ({:.1}°) | vel={:.1} | I={:.1} mA | en={}",
+                topo_name,
+                sel,
+                motor_states[sel].target,
+                shaft_angles[sel],
+                shaft_angles[sel] * 180.0 / core::f32::consts::PI,
+                shaft_vels[sel],
+                measured_currents[sel],
+                if motors[sel].enabled != 0 { 1 } else { 0 }
             );
         }
     }
 }
 
-fn handle_rtt_command(cmd: &str) {
-    let parts: heapless::Vec<&str, 4> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
+// ---------------------------------------------------------------------------
+// Unified Command Handler (Motors A..D, Kinematics K, Diagnostics)
+// ---------------------------------------------------------------------------
+fn handle_unified_command(
+    cmd: &str,
+    commander: &mut Commander4Axis<EmbassyClock>,
+    assembly: &mut ActuatorAssembly<4, 4>,
+) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
         return;
     }
-    match parts[0] {
-        "t" => {
-            if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
-                    let clamped = val.clamp(-0.80, 0.80);
-                    SHARED_SERVO.lock(|s| {
-                        let mut s = s.borrow_mut();
-                        s.target = clamped;
-                        s.controller_mode = 0; // ensure closed-loop angle mode
-                        s.enabled = true;
-                    });
-                    let deg = clamped * 180.0 / core::f32::consts::PI;
-                    rprintln!("-> Target angle set to {:.3} rad ({:.1}°) [ANG mode, enabled]", clamped, deg);
-                }
-            }
-        }
-        "d" => {
-            if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
-                    let clamped_deg = val.clamp(-46.0, 46.0);
-                    let rad = clamped_deg * core::f32::consts::PI / 180.0;
-                    SHARED_SERVO.lock(|s| {
-                        let mut s = s.borrow_mut();
-                        s.target = rad;
-                        s.controller_mode = 0; // ensure closed-loop angle mode
-                        s.enabled = true;
-                    });
-                    rprintln!("-> Target angle set to {:.1}° ({:.3} rad) [ANG mode, enabled]", clamped_deg, rad);
-                }
-            }
-        }
-        "e" => {
-            if parts.len() > 1 {
-                let en = parts[1] == "1" || parts[1] == "on";
-                SHARED_SERVO.lock(|s| s.borrow_mut().enabled = en);
-                rprintln!("-> Motor enabled: {}", en);
-            } else {
-                let en = SHARED_SERVO.lock(|s| {
-                    let mut s = s.borrow_mut();
-                    s.enabled = !s.enabled;
-                    s.enabled
-                });
-                rprintln!("-> Motor enabled toggled to: {}", en);
-            }
-        }
-        "p" => {
-            if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
-                    SHARED_SERVO.lock(|s| s.borrow_mut().p_angle = val);
-                    rprintln!("-> P_angle gain set to {:.2}", val);
-                }
-            }
-        }
-        "v" => {
-            if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
-                    SHARED_SERVO.lock(|s| s.borrow_mut().pid_vel_p = val);
-                    rprintln!("-> PID_velocity P gain set to {:.2}", val);
-                }
-            }
-        }
-        "u" => {
-            if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
-                    SHARED_SERVO.lock(|s| {
-                        let mut s = s.borrow_mut();
-                        s.target = val;
-                        s.controller_mode = 2; // voltage mode
-                        s.enabled = true;
-                    });
-                    rprintln!("-> Voltage mode target set to {:.2} V (motor enabled)", val);
-                }
-            }
-        }
-        "m" => {
-            if parts.len() > 1 {
-                let mode_code = match parts[1] {
-                    "a" | "angle" => 0,
-                    "v" | "vel" | "velocity" => 1,
-                    "u" | "volt" | "voltage" => 2,
-                    _ => 255,
-                };
-                if mode_code != 255 {
-                    SHARED_SERVO.lock(|s| s.borrow_mut().controller_mode = mode_code);
-                    rprintln!("-> Control mode changed to {}", parts[1]);
-                } else {
-                    rprintln!("Unknown mode. Use 'angle', 'vel', or 'volt'");
-                }
-            }
-        }
-        "s" => {
-            let (target, angle, vel, cur, en, p, vp, vi, mode) = SHARED_SERVO.lock(|s| {
-                let s = s.borrow();
-                (
-                    s.target,
-                    s.current_angle,
-                    s.current_velocity,
-                    s.current_ma,
-                    s.enabled,
-                    s.p_angle,
-                    s.pid_vel_p,
-                    s.pid_vel_i,
-                    s.controller_mode,
-                )
-            });
-            let deg = angle * 180.0 / core::f32::consts::PI;
-            let tgt_deg = target * 180.0 / core::f32::consts::PI;
-            let mode_str = match mode {
-                0 => "Angle (closed-loop)",
-                1 => "Velocity (open-loop)",
-                2 => "Voltage (open-loop)",
-                _ => "Unknown",
+
+    let first = trimmed.chars().next().unwrap_or(' ');
+    match first {
+        'A' | 'B' | 'C' | 'D' | 'a' | 'b' | 'c' | 'd' => {
+            let mot_idx = match first.to_ascii_uppercase() {
+                'A' => 0,
+                'B' => 1,
+                'C' => 2,
+                'D' => 3,
+                _ => 0,
             };
-            rprintln!("=== SERVO STATUS ===");
-            rprintln!("  Mode:           {}", mode_str);
-            rprintln!("  Enabled:        {}", en);
-            rprintln!("  Target:         {:.3} ({:.1}° / {:.2} V)", target, tgt_deg, target);
-            rprintln!("  Current Angle:  {:.3} rad ({:.1}°)", angle, deg);
-            rprintln!("  Velocity:       {:.2} rad/s", vel);
-            rprintln!("  Current:        {:.1} mA", cur);
-            rprintln!("  Gains:          P_ang={:.2}, Vel_P={:.2}, Vel_I={:.2}", p, vp, vi);
+            let payload = trimmed[1..].trim_start();
+            if payload.is_empty() {
+                SHARED_QUAD.lock(|sq| sq.borrow_mut().selected_motor = mot_idx as u8);
+                rprintln!("-> Selected Motor {} ('{}')", mot_idx, first.to_ascii_uppercase());
+            } else if let Ok(val) = payload.parse::<f32>() {
+                SHARED_QUAD.lock(|sq| {
+                    let mut sq = sq.borrow_mut();
+                    sq.motors[mot_idx].target = val;
+                    sq.motors[mot_idx].enabled = true;
+                });
+                rprintln!("-> Motor {} target set to {:.3}", mot_idx, val);
+            } else {
+                commander.run(trimmed);
+            }
         }
-        "cal" | "home" => {
-            let mut v = 4.0f32;
-            let mut thresh = 100.0f32;
+        'K' | 'k' => {
+            let payload = trimmed[1..].trim_start();
+            if payload.starts_with('M') || payload.starts_with('m') {
+                let m_arg = payload[1..].trim_start();
+                if let Ok(mode) = m_arg.parse::<u8>() {
+                    let preset = TopologyPreset::from_u8(mode);
+                    assembly.set_topology(preset);
+                    SHARED_QUAD.lock(|sq| {
+                        sq.borrow_mut().topology_mode = mode;
+                    });
+                    rprintln!("-> Kinematics topology mode set to {} ({:?})", mode, preset);
+                } else {
+                    rprintln!("-> Current topology mode: {}", assembly.topology_mode);
+                }
+            } else if payload.starts_with('T') || payload.starts_with('t') {
+                let parts: heapless::Vec<&str, 4> = payload[1..].split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let (Ok(j), Ok(rad)) = (parts[0].parse::<usize>(), parts[1].parse::<f32>()) {
+                        if j < 4 {
+                            assembly.set_joint_target(j, rad);
+                            SHARED_QUAD.lock(|sq| {
+                                sq.borrow_mut().joint_targets[j] = rad;
+                            });
+                            rprintln!("-> Joint {} target set to {:.3} rad", j, rad);
+                        }
+                    }
+                }
+            } else {
+                let _ = KinematicsCommander::handle(&mut commander.kinematics, payload);
+            }
+        }
+        't' => {
+            let parts: heapless::Vec<&str, 4> = trimmed.split_whitespace().collect();
             if parts.len() > 1 {
                 if let Ok(val) = parts[1].parse::<f32>() {
-                    v = val.clamp(0.5, 5.0);
+                    SHARED_QUAD.lock(|sq| {
+                        let mut sq = sq.borrow_mut();
+                        let sel = sq.selected_motor as usize;
+                        sq.motors[sel].target = val;
+                        sq.motors[sel].enabled = true;
+                    });
+                    rprintln!("-> Target set to {:.3} on selected motor", val);
                 }
             }
-            if parts.len() > 2 {
-                if let Ok(val) = parts[2].parse::<f32>() {
-                    thresh = val.clamp(20.0, 600.0);
-                }
-            }
-            SHARED_SERVO.lock(|s| {
-                let mut s = s.borrow_mut();
-                s.homing_voltage = v;
-                s.stall_threshold_ma = thresh;
-                s.homing_requested = true;
-            });
-            rprintln!("-> Triggered endpoint stall homing (V={:.2}V, threshold={:.1}mA)", v, thresh);
         }
-        "h" | "?" => {
-            rprintln!("Available RTT Commands:");
-            rprintln!("  home [V] [mA] - Auto-detect hard-stop endpoints via current sense (e.g. 'home 1.5 120')");
-            rprintln!("  t <rad>       - Set target angle in radians (e.g. 't 1.57')");
-            rprintln!("  d <deg>       - Set target angle in degrees (e.g. 'd 90')");
-            rprintln!("  u <volts>     - Drive motor in voltage mode (e.g. 'u 2.5')");
-            rprintln!("  m <mode>      - Change mode: 'angle', 'vel', 'volt'");
-            rprintln!("  e 1 / 0       - Enable (1) or Disable (0) motor bridge");
-            rprintln!("  p <val>       - Set position P_angle gain");
-            rprintln!("  v <val>       - Set velocity loop P gain");
-            rprintln!("  s             - Print full status");
+        'e' => {
+            let parts: heapless::Vec<&str, 4> = trimmed.split_whitespace().collect();
+            let en = if parts.len() > 1 {
+                parts[1] == "1" || parts[1] == "on"
+            } else {
+                true
+            };
+            SHARED_QUAD.lock(|sq| {
+                let mut sq = sq.borrow_mut();
+                let sel = sq.selected_motor as usize;
+                sq.motors[sel].enabled = en;
+            });
+            rprintln!("-> Selected motor enabled: {}", en);
+        }
+        's' => {
+            let (sq, topo) = SHARED_QUAD.lock(|s| (*s.borrow(), assembly.topology()));
+            rprintln!("=== FISHYSERVO 4-AXIS STATUS ===");
+            rprintln!("  Topology: {:?} (mode={})", topo, sq.topology_mode);
+            rprintln!("  Sensor Map: {:?}", sq.sensor_map);
+            for i in 0..4 {
+                let m = &sq.motors[i];
+                rprintln!(
+                    "  Motor {}: en={}, tgt={:.3}, ang={:.3} rad, vel={:.1} rad/s, I={:.1} mA",
+                    i,
+                    m.enabled,
+                    m.target,
+                    m.current_angle,
+                    m.current_velocity,
+                    m.current_ma
+                );
+            }
+        }
+        'h' | '?' => {
+            rprintln!("Available Commands:");
+            rprintln!("  A..D [val]     - Select motor or set target (e.g. 'A 1.57')");
+            rprintln!("  KM <0..3>      - Set topology mode (0=4x1Dof, 1=2x2Dof, 2=1x1+1x2, 3=2x1+1x2)");
+            rprintln!("  KT <j> <rad>   - Set joint target position");
+            rprintln!("  KA <j>         - Query joint angle");
+            rprintln!("  e 1 / 0        - Enable / Disable selected motor");
+            rprintln!("  t <val>        - Set target on selected motor");
+            rprintln!("  s              - Print 4-axis multi-topology status");
         }
         _ => {
-            rprintln!("Unknown command: '{}'. Type 'h' for help.", parts[0]);
+            rprintln!("Unknown command: '{}'. Type 'h' for help.", trimmed);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Handsfree bootloader entry (raw single-byte write [0xF0] to I2C address 0x40)
+// Handsfree Bootloader Entry
 // ---------------------------------------------------------------------------
-// This hook runs in whatever context calls Stm32I2cTarget::service_once. The
-// I2C2 target task is spawned on the high-priority InterruptExecutor below, so
-// this executes in interrupt context and preempts a starved motor task.
 fn bootloader_write_hook(frame: &[u8]) {
     if frame.len() == 1 && frame[0] == 0xF0 {
-        barefoc_stm32::request_bootloader();
+        barefoc_stm32::bootloader::enter_bareboot(barefoc_stm32::bootloader::default_target());
     }
 }
 
-// Dedicated interrupt executor for the I2C2 target task. TIM6 is a basic timer
-// that is unused by the application (TIM1/TIM3 drive PWM, TIM2 is the Embassy
-// time driver); only its NVIC vector is needed to pend the executor, the
-// peripheral itself is never configured or enabled.
+// Dedicated interrupt executor for I2C2 target task
 static I2C_TARGET_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
@@ -766,47 +835,71 @@ unsafe fn TIM6() {
 }
 
 // ---------------------------------------------------------------------------
-// I2C2 Multibus Server Task (Address 0x40)
+// MultiBus Topology Write Hook (0x78)
+// ---------------------------------------------------------------------------
+fn topology_mode_hook<const N: usize, B: RegisterBridge>(
+    _ctx: &mut MultiMotorState<N, B>,
+    _offset: u8,
+    bytes: &[u8],
+) -> HookResult {
+    if !bytes.is_empty() {
+        let mode = bytes[0];
+        SHARED_QUAD.lock(|s| {
+            s.borrow_mut().topology_mode = mode;
+        });
+        HookResult::Applied
+    } else {
+        HookResult::SelfClear
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I2C2 Multi-Motor Multibus Server Task (Address 0x40)
 // ---------------------------------------------------------------------------
 #[embassy_executor::task]
-async fn i2c_target_task(mut target: Stm32I2cTarget<'static, SharedServoState, 256, 128>) {
-    rprintln!("I2C2 Multibus target server listening on address 0x40.");
+async fn i2c_target_task(
+    mut target: Stm32I2cTarget<'static, MultiMotorState<4, SharedServoState>, 384, 128>,
+) {
+    rprintln!("I2C2 Multi-Motor Multibus target server listening on address 0x40.");
 
     loop {
-        // Refresh telemetry before servicing host transactions
-        let (angle, vel, cur, stat) = SHARED_SERVO.lock(|s| {
+        // 1. Sync telemetry from SHARED_QUAD into target server
+        let (selected, sq_motors) = SHARED_QUAD.lock(|s| {
             let s = s.borrow();
-            (s.current_angle, s.current_velocity, s.current_ma, s.status)
+            (s.selected_motor, s.motors)
         });
 
         {
             let map = target.server_mut().map_mut();
-            map.handler().current_angle = angle;
-            map.handler().current_velocity = vel;
-            map.handler().current_ma = cur;
-            map.handler().status = stat;
-            barefoc_multibus::refresh_telemetry(map);
+            let _ = map.handler().set_selected(selected);
+            for i in 0..4 {
+                map.handler().motors[i] = sq_motors[i];
+            }
+            refresh_telemetry_multi(map);
         }
 
-        // Service bus events if pending
+        // 2. Service bus transactions
         match target.service_once::<I2C2>() {
             Ok(ServiceOutcome::Idle) => {
-                // Bus is idle, yield briefly to avoid hogging executor
                 Timer::after_micros(200).await;
             }
             Ok(ServiceOutcome::WritePhase { .. }) => {
-                // Host wrote to registers - propagate updated state into SHARED_SERVO
-                let handler = *target.server_mut().map_mut().handler();
-                SHARED_SERVO.lock(|s| {
+                let handler = target.server_mut().map_mut().handler();
+                let sel = handler.selected();
+                let motors = handler.motors;
+                SHARED_QUAD.lock(|s| {
                     let mut s = s.borrow_mut();
-                    s.target = handler.target;
-                    s.enabled = handler.enabled;
-                    s.p_angle = handler.p_angle;
-                    s.pid_vel_p = handler.pid_vel_p;
-                    s.pid_vel_i = handler.pid_vel_i;
-                    s.pid_vel_d = handler.pid_vel_d;
-                    s.voltage_limit = handler.voltage_limit;
-                    s.velocity_limit = handler.velocity_limit;
+                    s.selected_motor = sel;
+                    for i in 0..4 {
+                        s.motors[i].target = motors[i].target;
+                        s.motors[i].enabled = motors[i].enabled;
+                        s.motors[i].p_angle = motors[i].p_angle;
+                        s.motors[i].pid_vel_p = motors[i].pid_vel_p;
+                        s.motors[i].pid_vel_i = motors[i].pid_vel_i;
+                        s.motors[i].pid_vel_d = motors[i].pid_vel_d;
+                        s.motors[i].voltage_limit = motors[i].voltage_limit;
+                        s.motors[i].velocity_limit = motors[i].velocity_limit;
+                    }
                 });
                 embassy_futures::yield_now().await;
             }
@@ -869,11 +962,11 @@ async fn main(spawner: Spawner) {
     let rtt_down = channels.down.0;
 
     rprintln!("\r\n=======================================================");
-    rprintln!("     N20 Closed-Loop Servo with BareFOC & Multibus    ");
+    rprintln!("     FishyServo Quad H-Bridge Multi-Topology Servo     ");
     rprintln!("     Microcontroller: STM32H503KBU6 (Arm Cortex-M33)  ");
-    rprintln!("     Bridge D: TIM1_CH2 (PA9) / TIM3_CH3 (PB0)        ");
-    rprintln!("     Sensor: TMAG5273 on I2C1 (PB6/PB7)               ");
-    rprintln!("     Host Bus: Multibus on I2C2 (PB3/PB4 @ 0x40)      ");
+    rprintln!("     Bridges: A (PA15/PB5), B (PA8/PB15), C (PA6/PA7), D (PA9/PB0)");
+    rprintln!("     Sensors: TMAG5273 on I2C1 (PB6/PB7)               ");
+    rprintln!("     Host Bus: MultiBus on I2C2 (PB3/PB4 @ 0x40)      ");
     rprintln!("=======================================================");
 
     let mut config = embassy_stm32::Config::default();
@@ -883,22 +976,12 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
     let boot_start = Instant::now();
 
-    // -----------------------------------------------------------------------
-    // DBGMCU Configuration: Keep CoreSight debug clocks running during low-power
-    // sleep (WFE/WFI), stop, and standby modes.
-    // On STM32H5, WFE/WFI in the Embassy executor idle loop gates debug clocks
-    // by default, disabling SWD immediately on boot unless un-gated here.
-    // Also freeze watchdog timers (IWDG, WWDG) when CPU is halted by debugger.
-    // -----------------------------------------------------------------------
+    // DBGMCU: Keep CoreSight debug clocks running during sleep/stop
     embassy_stm32::pac::DBGMCU.cr().modify(|w| {
         w.set_stop(true);
         w.set_standby(true);
     });
 
-    // SAFETY: DBGMCU_CR (0x4402_4004) and DBGMCU_APB1LFZR (0x4402_4008) are valid
-    // hardware memory-mapped registers for the STM32H503 microcontroller.
-    // Writing bits 0..2 (0x07) sets DBG_SLEEP, DBG_STOP, DBG_STANDBY.
-    // Writing bits 11, 12 in APB1LFZR freezes WWDG and IWDG during debug halt.
     unsafe {
         let dbgmcu_cr = 0x4402_4004 as *mut u32;
         core::ptr::write_volatile(dbgmcu_cr, core::ptr::read_volatile(dbgmcu_cr) | 0x07);
@@ -911,12 +994,14 @@ async fn main(spawner: Spawner) {
     }
 
     // -----------------------------------------------------------------------
-    // Task 3.3: Configure I2C2 Target at address 0x40 running barefoc-multibus
-    // This is done BEFORE sensor discovery so the host bus is available while
-    // the I2C1 scan is still running. The target hardware ACKs its address as
-    // soon as the peripheral is configured, and the target task is spawned now
-    // on the high-priority interrupt executor so it is ready before the
-    // blocking sensor discovery below begins.
+    // USART1 Console (PA11 RX, PA12 TX @ 115200 baud)
+    // -----------------------------------------------------------------------
+    let mut usart_cfg = UartConfig::default();
+    usart_cfg.baudrate = 115_200;
+    let uart = Uart::new_blocking(p.USART1, p.PA12, p.PA11, usart_cfg).ok();
+
+    // -----------------------------------------------------------------------
+    // I2C2 Multi-Motor MultiBus Target (Address 0x40)
     // -----------------------------------------------------------------------
     let mut i2c2_cfg = I2cConfig::default();
     i2c2_cfg.sda_pullup = true;
@@ -924,88 +1009,134 @@ async fn main(spawner: Spawner) {
     i2c2_cfg.frequency = Hertz::khz(100);
     let i2c2 = I2c::new_blocking(p.I2C2, p.PB3, p.PB4, i2c2_cfg);
 
-    let initial_state = SharedServoState::new();
-    let multibus_map = barefoc_multibus::simplefoc_profile(initial_state);
+    let initial_motors = [SharedServoState::new(); 4];
+    let mut multibus_map = multi_motor_profile(initial_motors);
+
+    // Register 0x78: TopologyMode RW hook for runtime topology switching
+    let _ = multibus_map.add_register(RegEntry::rw_hooked(REG_TOPOLOGY_MODE, 1, topology_mode_hook));
+
     let server = RegServer::new(multibus_map);
     let mut target =
         Stm32I2cTarget::new(i2c2, 0x40, server).expect("I2C2 Target binding failed");
-    // Raw single-byte write [0xF0] to address 0x40 requests the BareBoot
-    // bootloader. Installed as a raw-frame hook so it is observed before the
-    // register server latches 0xF0 as a pointer, and dispatched from the
-    // interrupt-context task below so it cannot be starved by the motor loop.
     target.set_write_frame_hook(Some(bootloader_write_hook));
 
-    // Run the I2C2 target on a high-priority interrupt executor so bus events
-    // (including the bootloader trigger) are serviced even while the 1 kHz
-    // motor task monopolises the cooperative thread executor. TIM6's NVIC
-    // vector is only used to pend this executor; set its priority before start.
     interrupt::TIM6.set_priority(Priority::P8);
     let i2c_spawner = I2C_TARGET_EXECUTOR.start(interrupt::TIM6);
     i2c_spawner.spawn(i2c_target_task(target).expect("Failed to create i2c target task token"));
 
-    // Yield once so the target task enters its service loop before the
-    // blocking I2C1 discovery below monopolises the executor.
     Timer::after_millis(1).await;
-    rprintln!(
-        "I2C2 target ready at 0x40 ({} ms after init).",
-        boot_start.elapsed().as_millis()
-    );
+    rprintln!("I2C2 target ready at 0x40 ({} ms after init).", boot_start.elapsed().as_millis());
 
     // -----------------------------------------------------------------------
-    // Task 2.1: Safe boot Coast mode on Bridges A, B, C (Outputs LOW)
-    // Note: SWD pins PA13 (SWDIO) and PA14 (SWCLK) are strictly preserved
-    // and never initialized or disturbed by GPIO configuration.
-    // PA15 is JTDI, which is safely available as GPIO output in SWD mode.
-    // -----------------------------------------------------------------------
-    let _in_a1 = Output::new(p.PA15, Level::Low, Speed::Low);
-    let _in_a2 = Output::new(p.PB5, Level::Low, Speed::Low);
-    let _in_b1 = Output::new(p.PA8, Level::Low, Speed::Low);
-    let _in_b2 = Output::new(p.PB15, Level::Low, Speed::Low);
-    let _in_c1 = Output::new(p.PA6, Level::Low, Speed::Low);
-    let _in_c2 = Output::new(p.PA7, Level::Low, Speed::Low);
-
     // Status LEDs on PA0 (Blue) and PA1 (Red): Active LOW
-    let mut led_b = Output::new(p.PA0, Level::Low, Speed::Low); // Blue ON to signal booting
+    // -----------------------------------------------------------------------
+    let mut led_b = Output::new(p.PA0, Level::Low, Speed::Low); // Blue ON while booting
     let led_r = Output::new(p.PA1, Level::High, Speed::Low); // Red OFF
 
     // -----------------------------------------------------------------------
-    // Task 2.2: Channel D PWM on TIM1_CH2 (PA9) and TIM3_CH3 (PB0) at 25 kHz
+    // Quad H-Bridge Motor PWM Timers (TIM1, TIM3 at 25 kHz)
+    //
+    // Channel mapping:
+    // - Bridge A: PA15 (GPIO DIR) / PB5 (TIM1_CH3 PWM)
+    // - Bridge B: PA8 (TIM1_CH1)  / PB15 (TIM3_CH4)
+    // - Bridge C: PA6 (TIM3_CH1)  / PA7 (TIM3_CH2)
+    // - Bridge D: PA9 (TIM1_CH2)  / PB0 (TIM3_CH3)
     // -----------------------------------------------------------------------
-    let ch2_pin = PwmPin::new(p.PA9, OutputType::PushPull);
+    let tim1_ch1_pin = PwmPin::new(p.PA8, OutputType::PushPull);
+    let tim1_ch2_pin = PwmPin::new(p.PA9, OutputType::PushPull);
+    let tim1_ch3_pin = PwmPin::new(p.PB5, OutputType::PushPull);
     let pwm1 = SimplePwm::new(
         p.TIM1,
-        None,
-        Some(ch2_pin),
-        None,
+        Some(tim1_ch1_pin),
+        Some(tim1_ch2_pin),
+        Some(tim1_ch3_pin),
         None,
         Hertz(25_000),
         CountingMode::EdgeAlignedUp,
     );
 
-    let ch3_pin = PwmPin::new(p.PB0, OutputType::PushPull);
+    let tim3_ch1_pin = PwmPin::new(p.PA6, OutputType::PushPull);
+    let tim3_ch2_pin = PwmPin::new(p.PA7, OutputType::PushPull);
+    let tim3_ch3_pin = PwmPin::new(p.PB0, OutputType::PushPull);
+    let tim3_ch4_pin = PwmPin::new(p.PB15, OutputType::PushPull);
     let pwm3 = SimplePwm::new(
         p.TIM3,
-        None,
-        None,
-        Some(ch3_pin),
-        None,
+        Some(tim3_ch1_pin),
+        Some(tim3_ch2_pin),
+        Some(tim3_ch3_pin),
+        Some(tim3_ch4_pin),
         Hertz(25_000),
         CountingMode::EdgeAlignedUp,
     );
 
-    let mut channels1 = pwm1.split();
-    let mut channels3 = pwm3.split();
-    channels1.ch2.enable();
-    channels3.ch3.enable();
+    let mut ch1 = pwm1.split();
+    let mut ch3 = pwm3.split();
 
-    let mut driver = DCDriver2PWM::without_enable(channels1.ch2, channels3.ch3);
-    driver.params_mut().voltage_power_supply = 5.0;
-    driver.params_mut().voltage_limit = 5.0;
-    driver.params_mut().pwm_frequency = 25_000;
-    driver.init().expect("DCDriver2PWM init failed");
+    ch1.ch1.enable();
+    ch1.ch2.enable();
+    ch1.ch3.enable();
+    ch3.ch1.enable();
+    ch3.ch2.enable();
+    ch3.ch3.enable();
+    ch3.ch4.enable();
+
+    // Instantiate 4 H-Bridge Drivers
+    let pin_pa15 = Output::new(p.PA15, Level::Low, Speed::VeryHigh);
+    let mut driver_a = BridgeADriver::new(pin_pa15, ch1.ch3);
+    driver_a.params_mut().voltage_power_supply = 5.0;
+    driver_a.params_mut().voltage_limit = 5.0;
+    driver_a.params_mut().pwm_frequency = 25_000;
+    driver_a.init().expect("Driver A init failed");
+
+    let mut driver_b = DCDriver2PWM::without_enable(ch1.ch1, ch3.ch4);
+    driver_b.params_mut().voltage_power_supply = 5.0;
+    driver_b.params_mut().voltage_limit = 5.0;
+    driver_b.params_mut().pwm_frequency = 25_000;
+    driver_b.init().expect("Driver B init failed");
+
+    let mut driver_c = DCDriver2PWM::without_enable(ch3.ch1, ch3.ch2);
+    driver_c.params_mut().voltage_power_supply = 5.0;
+    driver_c.params_mut().voltage_limit = 5.0;
+    driver_c.params_mut().pwm_frequency = 25_000;
+    driver_c.init().expect("Driver C init failed");
+
+    let mut driver_d = DCDriver2PWM::without_enable(ch1.ch2, ch3.ch3);
+    driver_d.params_mut().voltage_power_supply = 5.0;
+    driver_d.params_mut().voltage_limit = 5.0;
+    driver_d.params_mut().pwm_frequency = 25_000;
+    driver_d.init().expect("Driver D init failed");
+
+    // Hold outputs in safe coast mode
+    driver_a.set_pwm(0.0);
+    driver_b.set_pwm(0.0);
+    driver_c.set_pwm(0.0);
+    driver_d.set_pwm(0.0);
 
     // -----------------------------------------------------------------------
-    // Task 2.3: Sensor Bus I2C1 (PB6/PB7) with internal pull-ups
+    // ADC1 Configuration (ISENS_A..D on PA2..PA5)
+    // -----------------------------------------------------------------------
+    let adc1 = Adc::new_blocking(p.ADC1, embassy_stm32::adc::Config::default());
+    GLOBAL_ADC.lock(|cell| {
+        *cell.borrow_mut() = Some(adc1);
+    });
+
+    let adc_pin_a = Stm32AdcPin::new(AdcInputPin::ChA(p.PA2), SampleTime::Cycles65);
+    let adc_pin_b = Stm32AdcPin::new(AdcInputPin::ChB(p.PA3), SampleTime::Cycles65);
+    let adc_pin_c = Stm32AdcPin::new(AdcInputPin::ChC(p.PA4), SampleTime::Cycles65);
+    let adc_pin_d = Stm32AdcPin::new(AdcInputPin::ChD(p.PA5), SampleTime::Cycles65);
+
+    let mut cs_a = CurrentMirrorSense::new(adc_pin_a, 200.0, 1000.0, 3.3, 12);
+    let mut cs_b = CurrentMirrorSense::new(adc_pin_b, 200.0, 1000.0, 3.3, 12);
+    let mut cs_c = CurrentMirrorSense::new(adc_pin_c, 200.0, 1000.0, 3.3, 12);
+    let mut cs_d = CurrentMirrorSense::new(adc_pin_d, 200.0, 1000.0, 3.3, 12);
+
+    cs_a.calibrate_offsets_rounds(&CLOCK, 200);
+    cs_b.calibrate_offsets_rounds(&CLOCK, 200);
+    cs_c.calibrate_offsets_rounds(&CLOCK, 200);
+    cs_d.calibrate_offsets_rounds(&CLOCK, 200);
+
+    // -----------------------------------------------------------------------
+    // Sensor Bus I2C1 (PB6/PB7) & TMAG5273 Discovery
     // -----------------------------------------------------------------------
     let mut i2c1_cfg = I2cConfig::default();
     i2c1_cfg.sda_pullup = true;
@@ -1018,33 +1149,21 @@ async fn main(spawner: Spawner) {
     rprintln!("     I2C1 TMAG5273 DISCOVERY (PB6/PB7 Pull-Ups)        ");
     rprintln!("=======================================================");
 
-    // Only the TMAG5273 factory addresses are probed: 0x35 (A1/A2), 0x22
-    // (B1/B2), 0x78 (C1/C2) and 0x44 (D1/D2). The previous 0x03..=0x77 sweep
-    // at three speeds spent hundreds of milliseconds in blocking timeouts and
-    // starved the I2C2 target task. The speed fallback order (20, 50, 100 kHz)
-    // and the variant detection semantics are unchanged.
     let speeds_khz = [20u32, 50u32, 100u32];
     let candidate_addrs = [0x35u8, 0x22, 0x78, 0x44];
     let mut detected_tmag = None;
 
     for &khz in &speeds_khz {
         set_i2c1_frequency(64_000_000, khz * 1000);
-        rprintln!("--- Probing TMAG5273 candidates on I2C1 @ {} kHz ---", khz);
-        let mut count = 0usize;
+        let mut _count = 0usize;
         for &addr in &candidate_addrs {
             let mut b = [0u8; 1];
-            // Read-only probe: a blocking write to an address that NACKs waits
-            // for the configured timeout, while a read NACKs immediately
-            // (hardware AUTOEND STOP). This keeps discovery short.
             let ack = i2c1.blocking_read(addr, &mut b).is_ok();
             if ack {
-                count += 1;
-                rprintln!("  [+] Device ACK at 7-bit 0x{:02X} (8-bit: 0x{:02X})", addr, addr << 1);
-
+                _count += 1;
                 let mut mfg = [0u8; 2];
                 if i2c1.blocking_write_read(addr, &[0x0E], &mut mfg).is_ok() {
                     let mfg_id = u16::from_le_bytes(mfg);
-                    rprintln!("      Reg 0x0E-0x0F (Mfg ID): 0x{:04X} ([0x{:02X}, 0x{:02X}])", mfg_id, mfg[0], mfg[1]);
                     if mfg_id == 0x5449 {
                         let mut dev_id = [0u8; 1];
                         let is_v2 = if i2c1.blocking_write_read(addr, &[0x0D], &mut dev_id).is_ok() {
@@ -1062,44 +1181,23 @@ async fn main(spawner: Spawner) {
                             (_, true) => DeviceVariant::A2,
                             (_, false) => DeviceVariant::A1,
                         };
-                        rprintln!("      -> Identified TI TMAG5273 ({:?}) at 0x{:02X}", variant, addr);
+                        rprintln!("  [+] Found TI TMAG5273 ({:?}) at 0x{:02X}", variant, addr);
                         if detected_tmag.is_none() {
                             detected_tmag = Some((addr, variant));
                         }
                     }
                 }
-                let mut who_am_i = [0u8; 1];
-                if i2c1.blocking_write_read(addr, &[0x75], &mut who_am_i).is_ok() {
-                    rprintln!("      Reg 0x75 (WHO_AM_I):    0x{:02X}", who_am_i[0]);
-                }
-                let mut id0 = [0u8; 1];
-                if i2c1.blocking_write_read(addr, &[0x00], &mut id0).is_ok() {
-                    rprintln!("      Reg 0x00 (CHIP_ID):     0x{:02X}", id0[0]);
-                }
-                let mut reg_dump = [0u8; 16];
-                if i2c1.blocking_write_read(addr, &[0x00], &mut reg_dump).is_ok() {
-                    rprintln!("      Regs 0x00..0x0F:        {:02X?}", reg_dump);
-                }
             }
         }
-        if count == 0 {
-            rprintln!("  [-] No TMAG5273 candidates responded on I2C1 at {} kHz.", khz);
-        }
         if detected_tmag.is_some() {
-            // Higher speeds are only a fallback for sensors that fail at the
-            // lower speed; stop at the first speed that identifies a device.
             break;
         }
     }
 
-    // Let the I2C2 target task service any host transaction that arrived while
-    // discovery was blocking the executor.
     Timer::after_millis(1).await;
-
     set_i2c1_frequency(64_000_000, 50_000);
-    rprintln!("=======================================================\n");
 
-    let (sensor, has_sensor) = if let Some((addr, variant)) = detected_tmag {
+    let (sensor_a, has_sensor) = if let Some((addr, variant)) = detected_tmag {
         match Tmag5273::builder(i2c1, addr)
             .variant(variant)
             .operating_mode(OperatingMode::ContinuousMeasure)
@@ -1108,103 +1206,95 @@ async fn main(spawner: Spawner) {
             .build()
         {
             Ok(dev) => {
-                rprintln!("TMAG5273 Sensor initialized successfully on I2C1 (Continuous Measure, XY Angle enabled).");
+                rprintln!("TMAG5273 Sensor initialized successfully on I2C1 (XY Angle enabled).");
                 (N20Sensor::Tmag(Tmag5273Sensor::new(dev)), true)
             }
             Err(e) => {
                 rprintln!("WARN: TMAG5273 init failed: {:?}. Fallback to dummy sensor.", e);
-                (N20Sensor::Fallback(barefoc_drivers::dc::DummySensor::new()), false)
+                (N20Sensor::Fallback(DummySensor::new()), false)
             }
         }
     } else {
-        rprintln!("NOTICE: No TMAG5273 detected on I2C1. Fallback to dummy sensor.");
-        (N20Sensor::Fallback(barefoc_drivers::dc::DummySensor::new()), false)
+        rprintln!("NOTICE: No TMAG5273 detected on I2C1. Fallback to dummy sensors.");
+        (N20Sensor::Fallback(DummySensor::new()), false)
     };
 
-    TMAG_DETECTED.store(has_sensor, Ordering::Relaxed);
-    if has_sensor {
-        rprintln!("TMAG5273 active! Real-time angle sensing enabled. LED blinking stopped (Solid Blue ON).");
-    }
+    let sensor_b = N20Sensor::Fallback(DummySensor::new());
+    let sensor_c = N20Sensor::Fallback(DummySensor::new());
+    let sensor_d = N20Sensor::Fallback(DummySensor::new());
 
     // -----------------------------------------------------------------------
-    // Task 2.4: ADC1 on PA5 (ISENS_D) with CurrentMirrorSense
+    // Instantiate 4 DCMotor Instances
     // -----------------------------------------------------------------------
-    let adc1 = Adc::new_blocking(p.ADC1, embassy_stm32::adc::Config::default());
-    let adc_pa5 = Stm32AdcPa5::new(adc1, p.PA5, SampleTime::Cycles65);
-    let mut current_sense = CurrentMirrorSense::new(adc_pa5, 200.0, 1000.0, 3.3, 12);
-    current_sense.calibrate_offsets_rounds(&CLOCK, 500);
-    rprintln!(
-        "CurrentMirrorSense calibrated: offset count = {}",
-        current_sense.offset_count()
-    );
+    let mut motor_a = DCMotor::new(&CLOCK);
+    motor_a.link_driver(QuadDCDriver::A(driver_a));
+    motor_a.link_sensor(sensor_a);
+    motor_a.link_current_sense(cs_a);
+    motor_a.sensor_direction = Direction::CCW;
+    motor_a.voltage_limit = 4.0;
+    motor_a.velocity_limit = 50.0;
+    motor_a.current_limit = 0.5;
+    motor_a.controller = if has_sensor { MotionControlType::angle } else { MotionControlType::velocity_openloop };
+    motor_a.torque_controller = TorqueControlType::voltage;
+    motor_a.P_angle.set_p(15.0);
+    motor_a.PID_velocity.set_p(1.2);
+    motor_a.PID_velocity.set_i(4.0);
+    motor_a.PID_velocity.set_d(0.0005);
+    let _ = motor_a.init();
 
-    // -----------------------------------------------------------------------
-    // Task 3.1: Initialize DCMotor with TMAG5273 Sensor
-    // -----------------------------------------------------------------------
-    let mut motor = DCMotor::new(&CLOCK);
-    motor.link_driver(driver);
-    motor.link_sensor(sensor);
-    motor.link_current_sense(current_sense);
+    let mut motor_b = DCMotor::new(&CLOCK);
+    motor_b.link_driver(QuadDCDriver::B(driver_b));
+    motor_b.link_sensor(sensor_b);
+    motor_b.link_current_sense(cs_b);
+    motor_b.sensor_direction = Direction::CCW;
+    motor_b.voltage_limit = 4.0;
+    motor_b.velocity_limit = 50.0;
+    motor_b.current_limit = 0.5;
+    motor_b.controller = MotionControlType::velocity_openloop;
+    motor_b.torque_controller = TorqueControlType::voltage;
+    motor_b.P_angle.set_p(15.0);
+    motor_b.PID_velocity.set_p(1.2);
+    motor_b.PID_velocity.set_i(4.0);
+    motor_b.PID_velocity.set_d(0.0005);
+    let _ = motor_b.init();
 
-    motor.sensor_direction = Direction::CCW;
-    motor.sensor_offset = -4.095; // default center from open-loop stroke calibration
-    motor.controller = if has_sensor {
-        MotionControlType::angle
-    } else {
-        MotionControlType::velocity_openloop
-    };
-    motor.torque_controller = TorqueControlType::voltage;
+    let mut motor_c = DCMotor::new(&CLOCK);
+    motor_c.link_driver(QuadDCDriver::C(driver_c));
+    motor_c.link_sensor(sensor_c);
+    motor_c.link_current_sense(cs_c);
+    motor_c.sensor_direction = Direction::CCW;
+    motor_c.voltage_limit = 4.0;
+    motor_c.velocity_limit = 50.0;
+    motor_c.current_limit = 0.5;
+    motor_c.controller = MotionControlType::velocity_openloop;
+    motor_c.torque_controller = TorqueControlType::voltage;
+    motor_c.P_angle.set_p(15.0);
+    motor_c.PID_velocity.set_p(1.2);
+    motor_c.PID_velocity.set_i(4.0);
+    motor_c.PID_velocity.set_d(0.0005);
+    let _ = motor_c.init();
 
-    motor.voltage_limit = 4.0; // 4.0 V max for micro N20 motor
-    motor.velocity_limit = 5.0; // 5.0 rad/s (~286 deg/s) max
-    motor.current_limit = 0.5; // 500 mA limit
+    let mut motor_d = DCMotor::new(&CLOCK);
+    motor_d.link_driver(QuadDCDriver::D(driver_d));
+    motor_d.link_sensor(sensor_d);
+    motor_d.link_current_sense(cs_d);
+    motor_d.sensor_direction = Direction::CCW;
+    motor_d.voltage_limit = 4.0;
+    motor_d.velocity_limit = 50.0;
+    motor_d.current_limit = 0.5;
+    motor_d.controller = MotionControlType::velocity_openloop;
+    motor_d.torque_controller = TorqueControlType::voltage;
+    motor_d.P_angle.set_p(15.0);
+    motor_d.PID_velocity.set_p(1.2);
+    motor_d.PID_velocity.set_i(4.0);
+    motor_d.PID_velocity.set_d(0.0005);
+    let _ = motor_d.init();
 
-    // Position servo PID loop tuning
-    motor.P_angle.set_p(15.0);
-    motor.P_angle.set_limit(5.0);
+    led_b.set_high(); // Boot complete
+    rprintln!("Boot complete: 4 motors initialized in safe coast mode ({} ms).", boot_start.elapsed().as_millis());
 
-    // Velocity sub-loop PID tuning
-    motor.PID_velocity.set_p(1.2);
-    motor.PID_velocity.set_i(4.0);
-    motor.PID_velocity.set_d(0.0005);
-    motor.PID_velocity.set_limit(4.0);
-    motor.PID_velocity.set_output_ramp(500.0);
-    motor.LPF_velocity.set_tf(0.015);
-
-    SHARED_SERVO.lock(|s| {
-        let mut s = s.borrow_mut();
-        s.controller_mode = if has_sensor { 0 } else { 1 };
-        s.target = 0.0;
-        s.enabled = false;
-        s.p_angle = 15.0;
-        s.pid_vel_p = 1.2;
-        s.pid_vel_i = 4.0;
-        s.pid_vel_d = 0.0005;
-        s.voltage_limit = 4.0;
-        s.velocity_limit = 5.0;
-    });
-
-    if has_sensor {
-        rprintln!("DCMotor initialized in CLOSED-LOOP ANGLE mode (Direction::CCW, center 0.0 rad).");
-    } else {
-        rprintln!("NOTICE: No TMAG sensor - falling back to velocity_openloop mode.");
-    }
-
-    let init_res = motor.init();
-    rprintln!("DCMotor init returned: {}", init_res);
-
-    // Signal boot completion: Blue LED OFF
-    led_b.set_high();
-    rprintln!(
-        "Boot complete: sensor={}, host bus 0x40 ({} ms after init).",
-        has_sensor,
-        boot_start.elapsed().as_millis()
-    );
-
-    // -----------------------------------------------------------------------
-    // Spawn Tasks
-    // -----------------------------------------------------------------------
-    spawner.spawn(motor_task(motor, led_b, led_r, has_sensor, rtt_down).expect("Failed to create motor task token"));
+    let motors = [motor_a, motor_b, motor_c, motor_d];
+    spawner.spawn(motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart).expect("Failed to create motor task token"));
 
     rprintln!("System running.");
 }

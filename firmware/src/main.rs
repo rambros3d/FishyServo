@@ -15,6 +15,14 @@ use barefoc_drivers::comms::registers::{RegisterError, RegisterId, RegisterValue
 use barefoc_drivers::comms::RegisterBridge;
 use barefoc_drivers::dc::traits::{DCDriver, DCDriverParams};
 use barefoc_drivers::dc::{CurrentMirrorSense, DCDriver2PWM, DCMotor, DummySensor};
+use barefoc::control_table::{
+    error_flags, ControlTable,
+    REG_PRESENT_BUS_VOLTAGE, REG_PRESENT_CURRENT,
+    REG_PRESENT_POSITION, REG_PRESENT_TEMPERATURE, REG_PRESENT_VELOCITY,
+    REG_REBOOT_CMD, REG_SAVE_CONFIG_CMD, CMD_SAVE_CONFIG, CMD_REBOOT_BOOTLOADER,
+};
+use barefoc::traits::storage::ConfigStorage;
+use barefoc_stm32::stm32h5::H5FlashStorage;
 use barefoc_multibus::profile::{
     multi_motor_profile, refresh_telemetry_multi, MultiMotorState,
 };
@@ -29,7 +37,7 @@ use embassy_stm32::i2c::{Config as I2cConfig, I2c, Master};
 use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::mode::Blocking;
-use embassy_stm32::peripherals::{ADC1, I2C2, PA2, PA3, PA4, PA5, TIM1, TIM3};
+use embassy_stm32::peripherals::{ADC1, I2C2, PA2, PA3, PA4, PA5, PB1, TIM1, TIM3};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::low_level::CountingMode;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm, SimplePwmChannel};
@@ -45,8 +53,17 @@ use tmag_rs::{AngleEnable, DeviceVariant, MagneticChannel, OperatingMode, Tmag52
 
 static TMAG_DETECTED: AtomicBool = AtomicBool::new(false);
 
+static GLOBAL_STORAGE: Mutex<
+    CriticalSectionRawMutex,
+    RefCell<Option<H5FlashStorage<embassy_stm32::flash::Flash<'static, Blocking>>>>,
+> = Mutex::new(RefCell::new(None));
+
+static SHARED_CONTROL_TABLE: Mutex<CriticalSectionRawMutex, RefCell<ControlTable>> =
+    Mutex::new(RefCell::new(ControlTable::empty()));
+
 /// Custom register offset for runtime topology switching over MultiBus.
 pub const REG_TOPOLOGY_MODE: u8 = 0x78;
+
 
 // ---------------------------------------------------------------------------
 // System Clock implementing barefoc::common::time::Clock via Embassy Instant
@@ -77,6 +94,7 @@ pub enum AdcInputPin {
     ChB(Peri<'static, PA3>),
     ChC(Peri<'static, PA4>),
     ChD(Peri<'static, PA5>),
+    Vsens(Peri<'static, PB1>),
 }
 
 pub struct Stm32AdcPin {
@@ -102,6 +120,7 @@ impl AdcPin for Stm32AdcPin {
                         AdcInputPin::ChB(pin) => adc.blocking_read(pin, self.sample_time),
                         AdcInputPin::ChC(pin) => adc.blocking_read(pin, self.sample_time),
                         AdcInputPin::ChD(pin) => adc.blocking_read(pin, self.sample_time),
+                        AdcInputPin::Vsens(pin) => adc.blocking_read(pin, self.sample_time),
                     };
                     sum += val as u32;
                 }
@@ -110,6 +129,25 @@ impl AdcPin for Stm32AdcPin {
         (sum / SAMPLES) as u16
     }
 }
+
+/// Read internal MCU core temperature sensor in degrees Celsius.
+pub fn read_internal_temperature() -> f32 {
+    let mut sum: u32 = 0;
+    const SAMPLES: u32 = 4;
+    GLOBAL_ADC.lock(|cell| {
+        if let Some(ref mut adc) = *cell.borrow_mut() {
+            let mut temp_ch = adc.enable_temperature();
+            for _ in 0..SAMPLES {
+                sum += adc.blocking_read(&mut temp_ch, SampleTime::Cycles65) as u32;
+            }
+        }
+    });
+    let avg = (sum / SAMPLES) as f32;
+    // Conversion for STM32H5 internal temp sensor: ~0.70V at 25C, 2.5mV/C
+    let v_sense = (avg * 3.3) / 4095.0;
+    ((v_sense - 0.70) / 0.0025) + 25.0
+}
+
 
 // ---------------------------------------------------------------------------
 // Bridge A Sign-Magnitude H-Bridge Driver (PA15 DIR, PB5 PWM on TIM1_CH3)
@@ -462,7 +500,9 @@ async fn motor_task(
     has_sensor: bool,
     mut down: DownChannel,
     mut uart: Option<Uart<'static, Blocking>>,
+    mut vsens_pin: Stm32AdcPin,
 ) {
+
     TMAG_DETECTED.store(has_sensor, Ordering::Relaxed);
     let mut ticker = Ticker::every(Duration::from_millis(1));
     let mut loop_count: u32 = 0;
@@ -601,6 +641,53 @@ async fn motor_task(
             statuses[i] = stat;
         }
 
+        // 7. Measure hardware telemetry: VSENS (PB1) bus voltage & internal MCU temperature
+        let raw_vsens = vsens_pin.read() as f32;
+        let bus_voltage = (raw_vsens * 3.3 / 4095.0) * 2.0;
+        let mcu_temp = read_internal_temperature();
+        let max_current_a = measured_currents.iter().cloned().fold(0.0f32, f32::max) / 1000.0;
+
+        // 8. Update unified Control Table with telemetry and evaluate error status
+        SHARED_CONTROL_TABLE.lock(|ct| {
+            let mut table = ct.borrow_mut();
+            table.evaluate_errors(max_current_a, bus_voltage, mcu_temp);
+            table.enforce_limits();
+
+            table.write_f32(REG_PRESENT_BUS_VOLTAGE, bus_voltage);
+            table.write_f32(REG_PRESENT_TEMPERATURE, mcu_temp);
+            table.write_f32(REG_PRESENT_CURRENT, max_current_a);
+            table.write_f32(REG_PRESENT_POSITION, shaft_angles[0]);
+            table.write_f32(REG_PRESENT_VELOCITY, shaft_vels[0]);
+
+            // SaveConfig trigger (0x55 written to 0x64)
+            if table.read_u8(REG_SAVE_CONFIG_CMD) == CMD_SAVE_CONFIG {
+                table.write_u8(REG_SAVE_CONFIG_CMD, 0);
+                GLOBAL_STORAGE.lock(|gs| {
+                    if let Some(ref mut st) = *gs.borrow_mut() {
+                        let _ = st.save_config(&table);
+                    }
+                });
+                rprintln!("Flash configuration saved to Bank 2 sectors.");
+            }
+
+            // RebootCommand trigger (0xF0 written to 0x63)
+            if table.read_u8(REG_REBOOT_CMD) == CMD_REBOOT_BOOTLOADER {
+                table.write_u8(REG_REBOOT_CMD, 0);
+                // Disarm all drivers into Coast mode
+                for m in motors.iter_mut() {
+                    m.disable();
+                }
+                barefoc_stm32::bootloader::enter_bareboot(barefoc_stm32::bootloader::default_target());
+            }
+
+            // Red status LED reflects hardware error status
+            if table.hardware_error_status() != 0 {
+                led_r.set_low(); // Active low: LED ON
+            } else {
+                led_r.set_high(); // LED OFF
+            }
+        });
+
         // Publish back to SHARED_QUAD
         SHARED_QUAD.lock(|sq| {
             let mut sq = sq.borrow_mut();
@@ -613,6 +700,7 @@ async fn motor_task(
                 sq.joint_velocities[i] = assembly.joint_velocity(i);
             }
         });
+
 
         // 7. Service RTT & USART1 Commander commands (every 10 ms = 100 Hz)
         if loop_count % 10 == 0 {
@@ -713,7 +801,7 @@ fn handle_unified_command(
             if payload.is_empty() {
                 SHARED_QUAD.lock(|sq| sq.borrow_mut().selected_motor = mot_idx as u8);
                 rprintln!("-> Selected Motor {} ('{}')", mot_idx, first.to_ascii_uppercase());
-            } else if let Ok(val) = payload.parse::<f32>() {
+            } else if let Ok(val) = barefoc_commander::parse_f32(payload) {
                 SHARED_QUAD.lock(|sq| {
                     let mut sq = sq.borrow_mut();
                     sq.motors[mot_idx].target = val;
@@ -741,7 +829,7 @@ fn handle_unified_command(
             } else if payload.starts_with('T') || payload.starts_with('t') {
                 let parts: heapless::Vec<&str, 4> = payload[1..].split_whitespace().collect();
                 if parts.len() >= 2 {
-                    if let (Ok(j), Ok(rad)) = (parts[0].parse::<usize>(), parts[1].parse::<f32>()) {
+                    if let (Ok(j), Ok(rad)) = (parts[0].parse::<usize>(), barefoc_commander::parse_f32(parts[1])) {
                         if j < 4 {
                             assembly.set_joint_target(j, rad);
                             SHARED_QUAD.lock(|sq| {
@@ -758,7 +846,7 @@ fn handle_unified_command(
         't' => {
             let parts: heapless::Vec<&str, 4> = trimmed.split_whitespace().collect();
             if parts.len() > 1 {
-                if let Ok(val) = parts[1].parse::<f32>() {
+                if let Ok(val) = barefoc_commander::parse_f32(parts[1]) {
                     SHARED_QUAD.lock(|sq| {
                         let mut sq = sq.borrow_mut();
                         let sel = sq.selected_motor as usize;
@@ -1001,7 +1089,21 @@ async fn main(spawner: Spawner) {
     let uart = Uart::new_blocking(p.USART1, p.PA12, p.PA11, usart_cfg).ok();
 
     // -----------------------------------------------------------------------
-    // I2C2 Multi-Motor MultiBus Target (Address 0x40)
+    // Non-Volatile Flash Persistence (Bank 2 Sectors 14 & 15: 16 KiB)
+    // -----------------------------------------------------------------------
+    let flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH, embassy_stm32::flash::Config::default());
+    let mut storage = H5FlashStorage::new(flash);
+    let mut boot_table = ControlTable::new();
+    if storage.load_config(&mut boot_table).is_err() {
+        boot_table.set_error_flag(error_flags::FLASH_CORRUPT);
+    }
+    let node_id = boot_table.node_id();
+    rprintln!("Loaded configuration from flash: NodeId = 0x{:02X}", node_id);
+    SHARED_CONTROL_TABLE.lock(|ct| *ct.borrow_mut() = boot_table);
+    GLOBAL_STORAGE.lock(|gs| *gs.borrow_mut() = Some(storage));
+
+    // -----------------------------------------------------------------------
+    // I2C2 Multi-Motor MultiBus Target (Address from persisted NodeId)
     // -----------------------------------------------------------------------
     let mut i2c2_cfg = I2cConfig::default();
     i2c2_cfg.sda_pullup = true;
@@ -1017,7 +1119,7 @@ async fn main(spawner: Spawner) {
 
     let server = RegServer::new(multibus_map);
     let mut target =
-        Stm32I2cTarget::new(i2c2, 0x40, server).expect("I2C2 Target binding failed");
+        Stm32I2cTarget::new(i2c2, node_id, server).expect("I2C2 Target binding failed");
     target.set_write_frame_hook(Some(bootloader_write_hook));
 
     interrupt::TIM6.set_priority(Priority::P8);
@@ -1025,7 +1127,8 @@ async fn main(spawner: Spawner) {
     i2c_spawner.spawn(i2c_target_task(target).expect("Failed to create i2c target task token"));
 
     Timer::after_millis(1).await;
-    rprintln!("I2C2 target ready at 0x40 ({} ms after init).", boot_start.elapsed().as_millis());
+    rprintln!("I2C2 target ready at 0x{:02X} ({} ms after init).", node_id, boot_start.elapsed().as_millis());
+
 
     // -----------------------------------------------------------------------
     // Status LEDs on PA0 (Blue) and PA1 (Red): Active LOW
@@ -1124,6 +1227,7 @@ async fn main(spawner: Spawner) {
     let adc_pin_b = Stm32AdcPin::new(AdcInputPin::ChB(p.PA3), SampleTime::Cycles65);
     let adc_pin_c = Stm32AdcPin::new(AdcInputPin::ChC(p.PA4), SampleTime::Cycles65);
     let adc_pin_d = Stm32AdcPin::new(AdcInputPin::ChD(p.PA5), SampleTime::Cycles65);
+    let vsens_pin = Stm32AdcPin::new(AdcInputPin::Vsens(p.PB1), SampleTime::Cycles65);
 
     let mut cs_a = CurrentMirrorSense::new(adc_pin_a, 200.0, 1000.0, 3.3, 12);
     let mut cs_b = CurrentMirrorSense::new(adc_pin_b, 200.0, 1000.0, 3.3, 12);
@@ -1294,7 +1398,7 @@ async fn main(spawner: Spawner) {
     rprintln!("Boot complete: 4 motors initialized in safe coast mode ({} ms).", boot_start.elapsed().as_millis());
 
     let motors = [motor_a, motor_b, motor_c, motor_d];
-    spawner.spawn(motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart).expect("Failed to create motor task token"));
+    spawner.spawn(motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart, vsens_pin).expect("Failed to create motor task token"));
 
     rprintln!("System running.");
 }

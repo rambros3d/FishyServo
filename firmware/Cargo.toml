@@ -17,10 +17,11 @@ rtt-target = "0.6.2"
 panic-rtt-target = "0.2.0"
 heapless = "0.8"
 
-barefoc = { path = "/home/sun/Filelink/Firmwares/bareFOC/bareFOC", default-features = false, features = ["kinematics"] }
+barefoc = { path = "/home/sun/Filelink/Firmwares/bareFOC/bareFOC", default-features = false, features = ["kinematics", "boot"] }
 barefoc-drivers = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-drivers/barefoc-drivers", default-features = false }
 barefoc-commander = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-comms/barefoc-commander", default-features = false, features = ["barefoc", "embedded-io"] }
-barefoc-multibus = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-comms/barefoc-multibus", default-features = false, features = ["simplefoc-profile"] }
+barefoc-multibus = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-comms/barefoc-multibus", default-features = false, features = ["simplefoc-profile", "control-table"] }
+
 barefoc-stm32 = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-hal/barefoc-stm32", default-features = false, features = ["stm32h5", "multibus", "katapult"] }
 tmag-rs = { path = "/home/sun/Filelink/Firmwares/bareFOC/barefoc-drivers/tmag-rs", default-features = false, features = ["barefoc"] }
 
@@ -32,7 +33,7 @@ bootloader = []
 panic = "abort"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"

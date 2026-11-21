@@ -492,7 +492,6 @@ impl<'a> MotorControl<EmbassyClock> for AssemblyDCMotor<'a> {
 // ---------------------------------------------------------------------------
 // 1 kHz Quad Motor Control & Kinematics Task
 // ---------------------------------------------------------------------------
-#[embassy_executor::task]
 async fn motor_task(
     mut motors: [DCMotorType; 4],
     mut led_b: Output<'static>,
@@ -944,9 +943,12 @@ fn topology_mode_hook<const N: usize, B: RegisterBridge>(
 // ---------------------------------------------------------------------------
 // I2C2 Multi-Motor Multibus Server Task (Address 0x40)
 // ---------------------------------------------------------------------------
+type TargetType = Stm32I2cTarget<'static, MultiMotorState<4, SharedServoState>, 384, 128>;
+static mut TARGET_STORE: core::mem::MaybeUninit<TargetType> = core::mem::MaybeUninit::uninit();
+
 #[embassy_executor::task]
 async fn i2c_target_task(
-    mut target: Stm32I2cTarget<'static, MultiMotorState<4, SharedServoState>, 384, 128>,
+    target: &'static mut TargetType,
 ) {
     rprintln!("I2C2 Multi-Motor Multibus target server listening on address 0x40.");
 
@@ -1097,7 +1099,10 @@ async fn main(spawner: Spawner) {
     if storage.load_config(&mut boot_table).is_err() {
         boot_table.set_error_flag(error_flags::FLASH_CORRUPT);
     }
-    let node_id = boot_table.node_id();
+    let node_id = match boot_table.node_id() {
+        0x08..=0x77 => boot_table.node_id(),
+        _ => 0x40,
+    };
     rprintln!("Loaded configuration from flash: NodeId = 0x{:02X}", node_id);
     SHARED_CONTROL_TABLE.lock(|ct| *ct.borrow_mut() = boot_table);
     GLOBAL_STORAGE.lock(|gs| *gs.borrow_mut() = Some(storage));
@@ -1118,13 +1123,17 @@ async fn main(spawner: Spawner) {
     let _ = multibus_map.add_register(RegEntry::rw_hooked(REG_TOPOLOGY_MODE, 1, topology_mode_hook));
 
     let server = RegServer::new(multibus_map);
+    let target_node_id = if (0x08..=0x77).contains(&node_id) { node_id } else { 0x40 };
     let mut target =
-        Stm32I2cTarget::new(i2c2, node_id, server).expect("I2C2 Target binding failed");
+        Stm32I2cTarget::new(i2c2, target_node_id, server).expect("I2C2 Target binding failed");
     target.set_write_frame_hook(Some(bootloader_write_hook));
 
+    let target_ref: &'static mut TargetType = unsafe {
+        TARGET_STORE.write(target)
+    };
     interrupt::TIM6.set_priority(Priority::P8);
     let i2c_spawner = I2C_TARGET_EXECUTOR.start(interrupt::TIM6);
-    i2c_spawner.spawn(i2c_target_task(target).expect("Failed to create i2c target task token"));
+    i2c_spawner.spawn(i2c_target_task(target_ref).expect("Failed to create i2c target task token"));
 
     Timer::after_millis(1).await;
     rprintln!("I2C2 target ready at 0x{:02X} ({} ms after init).", node_id, boot_start.elapsed().as_millis());
@@ -1398,7 +1407,6 @@ async fn main(spawner: Spawner) {
     rprintln!("Boot complete: 4 motors initialized in safe coast mode ({} ms).", boot_start.elapsed().as_millis());
 
     let motors = [motor_a, motor_b, motor_c, motor_d];
-    spawner.spawn(motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart, vsens_pin).expect("Failed to create motor task token"));
-
     rprintln!("System running.");
+    motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart, vsens_pin).await;
 }

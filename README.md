@@ -6,6 +6,8 @@
 
 FishyServo is an open-source motor controller board based on the STM32H503KBU6 microcontroller (Arm Cortex-M33, up to 250 MHz) and dual Texas Instruments DRV8411A H-bridge drivers. The board provides 4 independent half/full H-bridge channels with low-side current sensing on each channel. When connected to an external Texas Instruments TMAG5273 3D Hall-effect magnetic sensor via a Flexible Printed Circuit (FPC) ribbon cable, the system operates as a closed-loop servo controller with absolute angular position feedback, dual isolated I2C buses, and Katapult / BareBoot bootloader support.
 
+> **Repository Scope**: This repository is dedicated strictly to hardware design, CAD assets, schematics, PCB fabrication files, and production test scripts. The production firmware has been upstreamed into the core [BareFOC](https://github.com/simplefoc/Arduino-FOC) ecosystem and is canonically maintained at [`bareFOC/examples/fishyservo_stm32h5`](https://github.com/bareFOC/bareFOC/tree/master/examples/fishyservo_stm32h5).
+
 ---
 
 ## Key Features
@@ -182,7 +184,7 @@ flowchart TD
 
 ## Firmware & Control System
 
-Firmware source files and build configurations are located in the [firmware/](https://github.com/rambros3d/FishyServo/tree/main/firmware) directory.
+The firmware for FishyServo is officially maintained upstream within the [BareFOC repository](https://github.com/bareFOC/bareFOC) under [`examples/fishyservo_stm32h5`](https://github.com/bareFOC/bareFOC/tree/master/examples/fishyservo_stm32h5). See [firmware/README.md](firmware/README.md) for quick build and flashing instructions.
 
 ### Control Pipeline Architecture
 

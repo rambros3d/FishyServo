@@ -20,6 +20,8 @@ use barefoc::control_table::{
     REG_PRESENT_BUS_VOLTAGE, REG_PRESENT_CURRENT,
     REG_PRESENT_POSITION, REG_PRESENT_TEMPERATURE, REG_PRESENT_VELOCITY,
     REG_REBOOT_CMD, REG_SAVE_CONFIG_CMD, CMD_SAVE_CONFIG, CMD_REBOOT_BOOTLOADER,
+    REG_POS_P_GAIN, REG_VEL_P_GAIN, REG_VEL_I_GAIN, REG_VEL_D_GAIN,
+    REG_VOLTAGE_LIMIT, REG_VELOCITY_LIMIT, REG_GOAL_POSITION, REG_TOPOLOGY_PRESET,
 };
 use barefoc::traits::storage::ConfigStorage;
 use barefoc_stm32::stm32h5::H5FlashStorage;
@@ -52,6 +54,7 @@ use tmag_rs::barefoc::Tmag5273Sensor;
 use tmag_rs::{AngleEnable, DeviceVariant, MagneticChannel, OperatingMode, Tmag5273};
 
 static TMAG_DETECTED: AtomicBool = AtomicBool::new(false);
+static SAVE_CONFIG_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_STORAGE: Mutex<
     CriticalSectionRawMutex,
@@ -60,6 +63,9 @@ static GLOBAL_STORAGE: Mutex<
 
 static SHARED_CONTROL_TABLE: Mutex<CriticalSectionRawMutex, RefCell<ControlTable>> =
     Mutex::new(RefCell::new(ControlTable::empty()));
+
+/// Custom register offset for flash configuration save trigger over MultiBus (0x55).
+pub const REG_SAVE_CONFIG_MULTIBUS: u8 = 0x64;
 
 /// Custom register offset for runtime topology switching over MultiBus.
 pub const REG_TOPOLOGY_MODE: u8 = 0x78;
@@ -107,6 +113,13 @@ pub fn calculate_crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Deterministically derive a unique 7-bit node ID from the 96-bit factory silicon UID.
+/// Maps into standard user I2C address range 0x10..=0x70 (97 addresses).
+pub fn derive_uid_node_id(uid: &[u8; 12]) -> u8 {
+    let crc = calculate_crc32(uid);
+    0x10 + (crc % 97) as u8
 }
 
 impl SoftResetMailbox {
@@ -609,6 +622,14 @@ async fn motor_task(
         asm_ref
     };
 
+    // Cold boot angle hydration in actuator assembly
+    for i in 0..4 {
+        let ang = motors[i].shaft_angle();
+        motors[i].target = ang;
+        assembly.set_joint_target(i, ang);
+        assembly.set_sensor_state(i, ang, 0.0);
+    }
+
     let mut lpf_currents = [
         LowPassFilter::new(0.015, 0.001, &CLOCK),
         LowPassFilter::new(0.015, 0.001, &CLOCK),
@@ -698,10 +719,10 @@ async fn motor_task(
             ];
 
             if assembly.topology() == TopologyPreset::Four1Dof {
-                // In independent 1-DOF mode, drive motors directly from target setpoints
+                // In independent 1-DOF mode, drive motors directly from hydrated target setpoints
                 for i in 0..4 {
-                    let tgt = if motor_states[i].controller_mode == 0 && joint_targets[i] != 0.0 {
-                        joint_targets[i]
+                    let tgt = if motor_states[i].controller_mode == 0 {
+                        motor_states[i].target
                     } else {
                         motor_states[i].target
                     };
@@ -713,7 +734,7 @@ async fn motor_task(
             }
         }
 
-        // 6. Current sensing, emergency trips & telemetry publish
+        // 6. Current sensing, emergency stall protection (< 2 ms) & telemetry publish
         let mut measured_currents = [0.0f32; 4];
         let mut shaft_angles = [0.0f32; 4];
         let mut shaft_vels = [0.0f32; 4];
@@ -729,12 +750,15 @@ async fn motor_task(
             let cur_ma = lpf_currents[i].update(raw_ma, &CLOCK);
             let stat = motors[i].motor_status as u8;
 
-            // Emergency trip (> 600 mA)
+            // Immediate emergency overcurrent stall protection (> 600 mA)
             if cur_ma > 600.0 && motors[i].enabled != 0 {
-                rprintln!("EMERGENCY OVERCURRENT TRIP ON MOTOR {}! I={:.1} mA > 600 mA. Disabled.", i, cur_ma);
+                rprintln!("EMERGENCY OVERCURRENT TRIP ON MOTOR {}! I={:.1} mA > 600 mA. Coasting.", i, cur_ma);
                 motors[i].disable();
                 SHARED_QUAD.lock(|sq| {
                     sq.borrow_mut().motors[i].enabled = false;
+                });
+                SHARED_CONTROL_TABLE.lock(|ct| {
+                    ct.borrow_mut().set_error_flag(error_flags::OVERCURRENT);
                 });
             }
 
@@ -750,9 +774,26 @@ async fn motor_task(
         let mcu_temp = read_internal_temperature();
         let max_current_a = measured_currents.iter().cloned().fold(0.0f32, f32::max) / 1000.0;
 
-        // 8. Update unified Control Table with telemetry and evaluate error status
+        // 8. Update unified Control Table with telemetry, sync MultiBus parameters, and evaluate error status
         SHARED_CONTROL_TABLE.lock(|ct| {
             let mut table = ct.borrow_mut();
+
+            // Synchronize runtime MultiBus register writes (SHARED_QUAD) into SHARED_CONTROL_TABLE
+            let (sq_motors, sq_topo, sq_selected) = SHARED_QUAD.lock(|sq| {
+                let s = sq.borrow();
+                (s.motors, s.topology_mode, s.selected_motor as usize)
+            });
+
+            let sel = if sq_selected < 4 { sq_selected } else { 0 };
+            table.write_u8(REG_TOPOLOGY_PRESET, sq_topo);
+            table.write_f32(REG_POS_P_GAIN, sq_motors[sel].p_angle);
+            table.write_f32(REG_VEL_P_GAIN, sq_motors[sel].pid_vel_p);
+            table.write_f32(REG_VEL_I_GAIN, sq_motors[sel].pid_vel_i);
+            table.write_f32(REG_VEL_D_GAIN, sq_motors[sel].pid_vel_d);
+            table.write_f32(REG_VOLTAGE_LIMIT, sq_motors[sel].voltage_limit);
+            table.write_f32(REG_VELOCITY_LIMIT, sq_motors[sel].velocity_limit);
+            table.set_motor_homing_offset(0, sq_motors[0].current_angle);
+
             table.evaluate_errors(max_current_a, bus_voltage, mcu_temp);
             table.enforce_limits();
 
@@ -762,8 +803,9 @@ async fn motor_task(
             table.write_f32(REG_PRESENT_POSITION, shaft_angles[0]);
             table.write_f32(REG_PRESENT_VELOCITY, shaft_vels[0]);
 
-            // SaveConfig trigger (0x55 written to 0x64)
-            if table.read_u8(REG_SAVE_CONFIG_CMD) == CMD_SAVE_CONFIG {
+            // SaveConfig trigger (0x55 written to 0x64 or ControlTable)
+            let save_req = SAVE_CONFIG_REQUESTED.swap(false, Ordering::Relaxed);
+            if save_req || table.read_u8(REG_SAVE_CONFIG_CMD) == CMD_SAVE_CONFIG {
                 table.write_u8(REG_SAVE_CONFIG_CMD, 0);
                 GLOBAL_STORAGE.lock(|gs| {
                     if let Some(ref mut st) = *gs.borrow_mut() {
@@ -1012,7 +1054,7 @@ fn handle_unified_command(
 }
 
 // ---------------------------------------------------------------------------
-// Handsfree Bootloader Entry
+// Handsfree Bootloader Entry & Strobe Hooks
 // ---------------------------------------------------------------------------
 fn bootloader_write_hook(frame: &[u8]) {
     if frame.len() == 1 && frame[0] == 0xF0 {
@@ -1027,6 +1069,26 @@ fn bootloader_write_hook(frame: &[u8]) {
         let mb = SoftResetMailbox::new(REQUEST_CANBOOT, active_node_id, 1);
         unsafe { write_soft_reset_mailbox(&mb) };
         barefoc_stm32::bootloader::enter_bareboot(barefoc_stm32::bootloader::default_target());
+    } else if (frame.len() >= 2 && frame[0] == REG_SAVE_CONFIG_MULTIBUS && frame[1] == CMD_SAVE_CONFIG)
+        || (frame.len() >= 2 && frame[0] == (REG_SAVE_CONFIG_CMD as u8) && frame[1] == CMD_SAVE_CONFIG)
+    {
+        SAVE_CONFIG_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MultiBus Save Config Write Hook (0x64)
+// ---------------------------------------------------------------------------
+fn multibus_save_config_hook<const N: usize, B: RegisterBridge>(
+    _ctx: &mut MultiMotorState<N, B>,
+    _offset: u8,
+    bytes: &[u8],
+) -> HookResult {
+    if !bytes.is_empty() && bytes[0] == CMD_SAVE_CONFIG {
+        SAVE_CONFIG_REQUESTED.store(true, Ordering::Relaxed);
+        HookResult::SelfClear
+    } else {
+        HookResult::Applied
     }
 }
 
@@ -1148,7 +1210,7 @@ fn set_i2c1_frequency(i2cclk: u32, frequency: u32) {
 // Main System Initialization
 // ---------------------------------------------------------------------------
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner: Spawner) {
     let channels = rtt_target::rtt_init! {
         up: {
             0: {
@@ -1247,19 +1309,22 @@ async fn main(spawner: Spawner) {
     }
     boot_table.set_hardware_uid(&uid);
 
-    let active_node_id = if mailbox_valid {
+    // Multi-tier deterministic address binding:
+    // Tier 1: RAM Mailbox -> Tier 2: Persisted NVM -> Tier 3: Silicon UID Hash
+    let (active_node_id, id_source) = if mailbox_valid && (0x08..=0x77).contains(&dynamic_node_id) {
         boot_table.set_node_id(dynamic_node_id);
-        dynamic_node_id
+        (dynamic_node_id, "SoftResetMailbox (Tier 1)")
+    } else if (0x08..=0x77).contains(&boot_table.node_id()) {
+        (boot_table.node_id(), "NVM FlashStorage (Tier 2)")
     } else {
-        match boot_table.node_id() {
-            0x08..=0x77 => boot_table.node_id(),
-            _ => 0x40,
-        }
+        let uid_id = derive_uid_node_id(&uid);
+        boot_table.set_node_id(uid_id);
+        (uid_id, "Silicon UID Hash (Tier 3)")
     };
     rprintln!(
         "Active NodeId = 0x{:02X} (source: {})",
         active_node_id,
-        if mailbox_valid { "SoftResetMailbox" } else { "FlashStorage" }
+        id_source
     );
     ACTIVE_NODE_ID.store(active_node_id, Ordering::Relaxed);
     SHARED_CONTROL_TABLE.lock(|ct| *ct.borrow_mut() = boot_table);
@@ -1274,8 +1339,32 @@ async fn main(spawner: Spawner) {
     i2c2_cfg.frequency = Hertz::khz(100);
     let i2c2 = I2c::new_blocking(p.I2C2, p.PB3, p.PB4, i2c2_cfg);
 
-    let initial_motors = [SharedServoState::new(); 4];
+    let mut initial_motors = [SharedServoState::new(); 4];
+    let persisted_p_ang = boot_table.read_f32(REG_POS_P_GAIN);
+    let persisted_v_p = boot_table.read_f32(REG_VEL_P_GAIN);
+    let persisted_v_i = boot_table.read_f32(REG_VEL_I_GAIN);
+    let persisted_v_d = boot_table.read_f32(REG_VEL_D_GAIN);
+    let persisted_v_lim = boot_table.read_f32(REG_VOLTAGE_LIMIT);
+    let persisted_vel_lim = boot_table.read_f32(REG_VELOCITY_LIMIT);
+    if persisted_p_ang.is_finite() && persisted_p_ang > 0.0 {
+        for m in initial_motors.iter_mut() {
+            m.p_angle = persisted_p_ang;
+            if persisted_v_p.is_finite() && persisted_v_p > 0.0 { m.pid_vel_p = persisted_v_p; }
+            if persisted_v_i.is_finite() && persisted_v_i >= 0.0 { m.pid_vel_i = persisted_v_i; }
+            if persisted_v_d.is_finite() && persisted_v_d >= 0.0 { m.pid_vel_d = persisted_v_d; }
+            if persisted_v_lim.is_finite() && persisted_v_lim > 0.0 { m.voltage_limit = persisted_v_lim; }
+            if persisted_vel_lim.is_finite() && persisted_vel_lim > 0.0 { m.velocity_limit = persisted_vel_lim; }
+        }
+    }
+
+    SHARED_QUAD.lock(|sq| {
+        sq.borrow_mut().motors = initial_motors;
+    });
+
     let mut multibus_map = multi_motor_profile(initial_motors);
+
+    // Register 0x64: SaveConfig hook (0x55 persists live tuning parameters to Bank 2)
+    let _ = multibus_map.add_register(RegEntry::rw_hooked(REG_SAVE_CONFIG_MULTIBUS, 1, multibus_save_config_hook));
 
     // Register 0x78: TopologyMode RW hook for runtime topology switching
     let _ = multibus_map.add_register(RegEntry::rw_hooked(REG_TOPOLOGY_MODE, 1, topology_mode_hook));
@@ -1508,10 +1597,12 @@ async fn main(spawner: Spawner) {
     motor_a.current_limit = 0.5;
     motor_a.controller = if has_sensor { MotionControlType::angle } else { MotionControlType::velocity_openloop };
     motor_a.torque_controller = TorqueControlType::voltage;
-    motor_a.P_angle.set_p(15.0);
-    motor_a.PID_velocity.set_p(1.2);
-    motor_a.PID_velocity.set_i(4.0);
-    motor_a.PID_velocity.set_d(0.0005);
+    motor_a.P_angle.set_p(initial_motors[0].p_angle);
+    motor_a.PID_velocity.set_p(initial_motors[0].pid_vel_p);
+    motor_a.PID_velocity.set_i(initial_motors[0].pid_vel_i);
+    motor_a.PID_velocity.set_d(initial_motors[0].pid_vel_d);
+    motor_a.voltage_limit = initial_motors[0].voltage_limit;
+    motor_a.velocity_limit = initial_motors[0].velocity_limit;
     let _ = motor_a.init();
 
     let mut motor_b = DCMotor::new(&CLOCK);
@@ -1519,15 +1610,15 @@ async fn main(spawner: Spawner) {
     motor_b.link_sensor(sensor_b);
     motor_b.link_current_sense(cs_b);
     motor_b.sensor_direction = Direction::CCW;
-    motor_b.voltage_limit = 4.0;
-    motor_b.velocity_limit = 50.0;
+    motor_b.voltage_limit = initial_motors[1].voltage_limit;
+    motor_b.velocity_limit = initial_motors[1].velocity_limit;
     motor_b.current_limit = 0.5;
     motor_b.controller = MotionControlType::velocity_openloop;
     motor_b.torque_controller = TorqueControlType::voltage;
-    motor_b.P_angle.set_p(15.0);
-    motor_b.PID_velocity.set_p(1.2);
-    motor_b.PID_velocity.set_i(4.0);
-    motor_b.PID_velocity.set_d(0.0005);
+    motor_b.P_angle.set_p(initial_motors[1].p_angle);
+    motor_b.PID_velocity.set_p(initial_motors[1].pid_vel_p);
+    motor_b.PID_velocity.set_i(initial_motors[1].pid_vel_i);
+    motor_b.PID_velocity.set_d(initial_motors[1].pid_vel_d);
     let _ = motor_b.init();
 
     let mut motor_c = DCMotor::new(&CLOCK);
@@ -1535,15 +1626,15 @@ async fn main(spawner: Spawner) {
     motor_c.link_sensor(sensor_c);
     motor_c.link_current_sense(cs_c);
     motor_c.sensor_direction = Direction::CCW;
-    motor_c.voltage_limit = 4.0;
-    motor_c.velocity_limit = 50.0;
+    motor_c.voltage_limit = initial_motors[2].voltage_limit;
+    motor_c.velocity_limit = initial_motors[2].velocity_limit;
     motor_c.current_limit = 0.5;
     motor_c.controller = MotionControlType::velocity_openloop;
     motor_c.torque_controller = TorqueControlType::voltage;
-    motor_c.P_angle.set_p(15.0);
-    motor_c.PID_velocity.set_p(1.2);
-    motor_c.PID_velocity.set_i(4.0);
-    motor_c.PID_velocity.set_d(0.0005);
+    motor_c.P_angle.set_p(initial_motors[2].p_angle);
+    motor_c.PID_velocity.set_p(initial_motors[2].pid_vel_p);
+    motor_c.PID_velocity.set_i(initial_motors[2].pid_vel_i);
+    motor_c.PID_velocity.set_d(initial_motors[2].pid_vel_d);
     let _ = motor_c.init();
 
     let mut motor_d = DCMotor::new(&CLOCK);
@@ -1551,16 +1642,45 @@ async fn main(spawner: Spawner) {
     motor_d.link_sensor(sensor_d);
     motor_d.link_current_sense(cs_d);
     motor_d.sensor_direction = Direction::CCW;
-    motor_d.voltage_limit = 4.0;
-    motor_d.velocity_limit = 50.0;
+    motor_d.voltage_limit = initial_motors[3].voltage_limit;
+    motor_d.velocity_limit = initial_motors[3].velocity_limit;
     motor_d.current_limit = 0.5;
     motor_d.controller = MotionControlType::velocity_openloop;
     motor_d.torque_controller = TorqueControlType::voltage;
-    motor_d.P_angle.set_p(15.0);
-    motor_d.PID_velocity.set_p(1.2);
-    motor_d.PID_velocity.set_i(4.0);
-    motor_d.PID_velocity.set_d(0.0005);
+    motor_d.P_angle.set_p(initial_motors[3].p_angle);
+    motor_d.PID_velocity.set_p(initial_motors[3].pid_vel_p);
+    motor_d.PID_velocity.set_i(initial_motors[3].pid_vel_i);
+    motor_d.PID_velocity.set_d(initial_motors[3].pid_vel_d);
     let _ = motor_d.init();
+
+    // Cold Boot Setpoint Hydration: Hydrate motor setpoint from measured shaft angle
+    let init_ang_a = if has_sensor { motor_a.shaft_angle() } else { 0.0 };
+    motor_a.target = init_ang_a;
+    let init_ang_b = motor_b.shaft_angle();
+    motor_b.target = init_ang_b;
+    let init_ang_c = motor_c.shaft_angle();
+    motor_c.target = init_ang_c;
+    let init_ang_d = motor_d.shaft_angle();
+    motor_d.target = init_ang_d;
+    let init_angles = [init_ang_a, init_ang_b, init_ang_c, init_ang_d];
+
+    SHARED_QUAD.lock(|sq| {
+        let mut sq = sq.borrow_mut();
+        for i in 0..4 {
+            sq.motors[i].target = init_angles[i];
+            sq.motors[i].current_angle = init_angles[i];
+            sq.joint_targets[i] = init_angles[i];
+            sq.joint_angles[i] = init_angles[i];
+        }
+    });
+
+    SHARED_CONTROL_TABLE.lock(|ct| {
+        let mut table = ct.borrow_mut();
+        table.write_f32(REG_GOAL_POSITION, init_ang_a);
+        table.write_f32(REG_PRESENT_POSITION, init_ang_a);
+    });
+
+    rprintln!("Cold Boot Setpoint Hydrated: Mot A target set to {:.3} rad ({:.1}°).", init_ang_a, init_ang_a * 180.0 / core::f32::consts::PI);
 
     led_b.set_high(); // Boot complete
     let elapsed_ms = Instant::now().checked_duration_since(boot_start).map(|d| d.as_millis()).unwrap_or(0);

@@ -25,7 +25,7 @@ The system SHALL sample `ISENS_D` on `PA5` using `CurrentMirrorSense` to measure
 - **THEN** `CurrentMirrorSense` reports proportional current magnitude scaled by the 200 µA/A mirror ratio
 
 ### Requirement: Host I2C2 Multibus Target Interface
-The system SHALL expose a SimpleFOC register map over `I2C2` at target address `0x40`, allowing external host controllers to read telemetry and update angle targets.
+The system SHALL expose a SimpleFOC register map over `I2C2` at the active dynamic address synchronized with the bootloader via `SoftResetMailbox` or persistent flash storage, allowing external host controllers to read telemetry, update angle targets, and command handsfree bootloader entry.
 
 #### Scenario: Host target angle write
 - **WHEN** host controller writes a 32-bit float angle setpoint to `RegId::Target` (0x02) over I2C2

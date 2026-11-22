@@ -3,6 +3,14 @@ name = "n20-servo"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+
+[[bin]]
+name = "n20-servo"
+path = "src/n20_bin.rs"
+
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7", features = ["set-vtor", "set-sp"] }

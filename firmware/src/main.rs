@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use barefoc::common::filter::LowPassFilter;
 use barefoc::common::time::Clock;
@@ -63,6 +63,96 @@ static SHARED_CONTROL_TABLE: Mutex<CriticalSectionRawMutex, RefCell<ControlTable
 
 /// Custom register offset for runtime topology switching over MultiBus.
 pub const REG_TOPOLOGY_MODE: u8 = 0x78;
+
+// ---------------------------------------------------------------------------
+// Soft-Reset Mailbox (0x2000_7FE0..0x2000_7FFF) & Katapult Synchronization
+// ---------------------------------------------------------------------------
+
+pub const SOFT_RESET_MAILBOX_ADDR: usize = 0x2000_7FE0;
+
+/// Magic token placed in SRAM mailbox to request staying in the bootloader indefinitely.
+pub const REQUEST_CANBOOT: u64 = 0x5984_E3FA_6CA1_589B;
+
+/// Magic token placed in SRAM mailbox for application handoff ("FISHAPP1" in ASCII).
+pub const REQUEST_APP: u64 = 0x4649_5348_4150_5031;
+
+/// Legacy BareBoot/Katapult start application token.
+pub const REQUEST_START_APP: u64 = 0x7B06_EC45_A9A8_243D;
+
+/// Hardware STM32H503 silicon unique identifier base address (96-bit / 12-byte).
+pub const UID_BASE: *const u8 = 0x08FF_F800 as *const u8;
+
+/// Soft-reset RAM mailbox preserved across warm reboots.
+/// Total size: 32 bytes (0x20) matching the reserved section at 0x2000_7FE0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftResetMailbox {
+    pub magic: u64,
+    pub dynamic_node_id: u8,
+    pub bus_type: u8,
+    pub flags: u16,
+    pub can_assigned_id: u32,
+    pub reserved: [u8; 12],
+    pub crc32: u32,
+}
+
+/// Standard IEEE 802.3 CRC32 calculation.
+pub fn calculate_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+impl SoftResetMailbox {
+    pub fn compute_crc(&self) -> u32 {
+        let bytes: [u8; 32] = unsafe { core::mem::transmute_copy(self) };
+        calculate_crc32(&bytes[..28])
+    }
+
+    pub fn is_valid(&self) -> bool {
+        (self.magic == REQUEST_APP || self.magic == REQUEST_CANBOOT || self.magic == REQUEST_START_APP)
+            && (0x08..=0x77).contains(&self.dynamic_node_id)
+            && self.crc32 == self.compute_crc()
+    }
+
+    pub fn new(magic: u64, dynamic_node_id: u8, bus_type: u8) -> Self {
+        let mut mb = Self {
+            magic,
+            dynamic_node_id,
+            bus_type,
+            flags: 0,
+            can_assigned_id: 0,
+            reserved: [0u8; 12],
+            crc32: 0,
+        };
+        mb.crc32 = mb.compute_crc();
+        mb
+    }
+}
+
+pub unsafe fn read_soft_reset_mailbox() -> Option<SoftResetMailbox> {
+    let ptr = SOFT_RESET_MAILBOX_ADDR as *const SoftResetMailbox;
+    let mb = core::ptr::read_volatile(ptr);
+    if mb.is_valid() {
+        Some(mb)
+    } else {
+        None
+    }
+}
+
+pub unsafe fn write_soft_reset_mailbox(mb: &SoftResetMailbox) {
+    let ptr = SOFT_RESET_MAILBOX_ADDR as *mut SoftResetMailbox;
+    core::ptr::write_volatile(ptr, *mb);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+static ACTIVE_NODE_ID: AtomicU8 = AtomicU8::new(0x40);
 
 
 // ---------------------------------------------------------------------------
@@ -489,11 +579,16 @@ impl<'a> MotorControl<EmbassyClock> for AssemblyDCMotor<'a> {
     fn loop_foc(&mut self, _clock: &EmbassyClock) {}
 }
 
+// Dedicated static storage to prevent stack overflow on Cortex-M33
+static mut MOTORS_STORE: core::mem::MaybeUninit<[DCMotorType; 4]> = core::mem::MaybeUninit::uninit();
+static mut ASSEMBLY_STORE: core::mem::MaybeUninit<ActuatorAssembly<4, 4>> = core::mem::MaybeUninit::uninit();
+static mut COMMANDER_STORE: core::mem::MaybeUninit<Commander4Axis<EmbassyClock>> = core::mem::MaybeUninit::uninit();
+
 // ---------------------------------------------------------------------------
 // 1 kHz Quad Motor Control & Kinematics Task
 // ---------------------------------------------------------------------------
 async fn motor_task(
-    mut motors: [DCMotorType; 4],
+    motors: &'static mut [DCMotorType; 4],
     mut led_b: Output<'static>,
     mut led_r: Output<'static>,
     has_sensor: bool,
@@ -506,8 +601,13 @@ async fn motor_task(
     let mut ticker = Ticker::every(Duration::from_millis(1));
     let mut loop_count: u32 = 0;
 
-    let mut assembly = ActuatorAssembly::<4, 4>::new().with_downsample(10);
-    assembly.set_topology(TopologyPreset::Four1Dof);
+    let mut assembly = unsafe {
+        let ptr = ASSEMBLY_STORE.as_mut_ptr();
+        ptr.write(ActuatorAssembly::<4, 4>::new().with_downsample(10));
+        let asm_ref = &mut *ptr;
+        asm_ref.set_topology(TopologyPreset::Four1Dof);
+        asm_ref
+    };
 
     let mut lpf_currents = [
         LowPassFilter::new(0.015, 0.001, &CLOCK),
@@ -516,7 +616,11 @@ async fn motor_task(
         LowPassFilter::new(0.015, 0.001, &CLOCK),
     ];
 
-    let mut commander4 = Commander4Axis::new_with_clock(&CLOCK);
+    let mut commander4 = unsafe {
+        let ptr = COMMANDER_STORE.as_mut_ptr();
+        ptr.write(Commander4Axis::new_with_clock(&CLOCK));
+        &mut *ptr
+    };
 
     let mut rtt_buf = [0u8; 64];
     let mut rtt_line: heapless::Vec<u8, 64> = heapless::Vec::new();
@@ -676,6 +780,9 @@ async fn motor_task(
                 for m in motors.iter_mut() {
                     m.disable();
                 }
+                let active_node_id = table.node_id();
+                let mb = SoftResetMailbox::new(REQUEST_CANBOOT, active_node_id, 1);
+                unsafe { write_soft_reset_mailbox(&mb) };
                 barefoc_stm32::bootloader::enter_bareboot(barefoc_stm32::bootloader::default_target());
             }
 
@@ -909,6 +1016,16 @@ fn handle_unified_command(
 // ---------------------------------------------------------------------------
 fn bootloader_write_hook(frame: &[u8]) {
     if frame.len() == 1 && frame[0] == 0xF0 {
+        let active_node_id = {
+            let id = SHARED_CONTROL_TABLE.lock(|ct| ct.borrow().node_id());
+            if (0x08..=0x77).contains(&id) {
+                id
+            } else {
+                ACTIVE_NODE_ID.load(Ordering::Relaxed)
+            }
+        };
+        let mb = SoftResetMailbox::new(REQUEST_CANBOOT, active_node_id, 1);
+        unsafe { write_soft_reset_mailbox(&mb) };
         barefoc_stm32::bootloader::enter_bareboot(barefoc_stm32::bootloader::default_target());
     }
 }
@@ -1091,6 +1208,27 @@ async fn main(spawner: Spawner) {
     let uart = Uart::new_blocking(p.USART1, p.PA12, p.PA11, usart_cfg).ok();
 
     // -----------------------------------------------------------------------
+    // Soft-Reset Mailbox (0x2000_7FE0) Inspection & Address Selection
+    // -----------------------------------------------------------------------
+    let mailbox = unsafe { read_soft_reset_mailbox() };
+    let (dynamic_node_id, mailbox_valid) = match mailbox {
+        Some(mb) => {
+            rprintln!(
+                "Valid SoftResetMailbox detected at 0x{:08X}: magic = 0x{:016X}, dynamic_node_id = 0x{:02X}, bus_type = {}",
+                SOFT_RESET_MAILBOX_ADDR,
+                mb.magic,
+                mb.dynamic_node_id,
+                mb.bus_type
+            );
+            (mb.dynamic_node_id, true)
+        }
+        None => {
+            rprintln!("SoftResetMailbox invalid or cold boot; falling back to Flash Sectors 14 & 15");
+            (0, false)
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // Non-Volatile Flash Persistence (Bank 2 Sectors 14 & 15: 16 KiB)
     // -----------------------------------------------------------------------
     let flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH, embassy_stm32::flash::Config::default());
@@ -1099,11 +1237,31 @@ async fn main(spawner: Spawner) {
     if storage.load_config(&mut boot_table).is_err() {
         boot_table.set_error_flag(error_flags::FLASH_CORRUPT);
     }
-    let node_id = match boot_table.node_id() {
-        0x08..=0x77 => boot_table.node_id(),
-        _ => 0x40,
+
+    // Populate factory silicon UID from STM32H503 UID_BASE into ControlTable
+    let mut uid = [0u8; 12];
+    unsafe {
+        for i in 0..12 {
+            uid[i] = core::ptr::read_volatile(UID_BASE.add(i));
+        }
+    }
+    boot_table.set_hardware_uid(&uid);
+
+    let active_node_id = if mailbox_valid {
+        boot_table.set_node_id(dynamic_node_id);
+        dynamic_node_id
+    } else {
+        match boot_table.node_id() {
+            0x08..=0x77 => boot_table.node_id(),
+            _ => 0x40,
+        }
     };
-    rprintln!("Loaded configuration from flash: NodeId = 0x{:02X}", node_id);
+    rprintln!(
+        "Active NodeId = 0x{:02X} (source: {})",
+        active_node_id,
+        if mailbox_valid { "SoftResetMailbox" } else { "FlashStorage" }
+    );
+    ACTIVE_NODE_ID.store(active_node_id, Ordering::Relaxed);
     SHARED_CONTROL_TABLE.lock(|ct| *ct.borrow_mut() = boot_table);
     GLOBAL_STORAGE.lock(|gs| *gs.borrow_mut() = Some(storage));
 
@@ -1123,7 +1281,7 @@ async fn main(spawner: Spawner) {
     let _ = multibus_map.add_register(RegEntry::rw_hooked(REG_TOPOLOGY_MODE, 1, topology_mode_hook));
 
     let server = RegServer::new(multibus_map);
-    let target_node_id = if (0x08..=0x77).contains(&node_id) { node_id } else { 0x40 };
+    let target_node_id = if (0x08..=0x77).contains(&active_node_id) { active_node_id } else { 0x40 };
     let mut target =
         Stm32I2cTarget::new(i2c2, target_node_id, server).expect("I2C2 Target binding failed");
     target.set_write_frame_hook(Some(bootloader_write_hook));
@@ -1136,7 +1294,8 @@ async fn main(spawner: Spawner) {
     i2c_spawner.spawn(i2c_target_task(target_ref).expect("Failed to create i2c target task token"));
 
     Timer::after_millis(1).await;
-    rprintln!("I2C2 target ready at 0x{:02X} ({} ms after init).", node_id, boot_start.elapsed().as_millis());
+    let elapsed_ms = Instant::now().checked_duration_since(boot_start).map(|d| d.as_millis()).unwrap_or(0);
+    rprintln!("I2C2 target ready at 0x{:02X} ({} ms after init).", active_node_id, elapsed_ms);
 
 
     // -----------------------------------------------------------------------
@@ -1404,9 +1563,14 @@ async fn main(spawner: Spawner) {
     let _ = motor_d.init();
 
     led_b.set_high(); // Boot complete
-    rprintln!("Boot complete: 4 motors initialized in safe coast mode ({} ms).", boot_start.elapsed().as_millis());
+    let elapsed_ms = Instant::now().checked_duration_since(boot_start).map(|d| d.as_millis()).unwrap_or(0);
+    rprintln!("Boot complete: 4 motors initialized in safe coast mode ({} ms).", elapsed_ms);
 
-    let motors = [motor_a, motor_b, motor_c, motor_d];
+    let motors_ref = unsafe {
+        let ptr = MOTORS_STORE.as_mut_ptr();
+        ptr.write([motor_a, motor_b, motor_c, motor_d]);
+        &mut *ptr
+    };
     rprintln!("System running.");
-    motor_task(motors, led_b, led_r, has_sensor, rtt_down, uart, vsens_pin).await;
+    motor_task(motors_ref, led_b, led_r, has_sensor, rtt_down, uart, vsens_pin).await;
 }

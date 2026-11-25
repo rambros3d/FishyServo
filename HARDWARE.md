@@ -38,7 +38,7 @@ Custom high-performance micro-servo controller board powered by the **STM32H503K
 | **12**| `PA6` | `IN_C1` | `TIM3_CH1` / GPIO | Motor Driver | Channel C PWM / Direction Input 1 |
 | **13**| `PA7` | `IN_C2` | `TIM3_CH2` / GPIO | Motor Driver | Channel C PWM / Direction Input 2 |
 | **14**| `PB0` | `IN_D2` | `TIM3_CH3` / GPIO | Motor Driver | Channel D PWM / Direction Input 2 |
-| **15**| `PB1` | `VSENS` | `ADC1_INP1` | Voltage Sense | Motor / Bus Supply Voltage sense divider |
+| **15**| `PB1` | `VSENS` | `ADC1_INP1` | Voltage Sense | Motor / Bus Supply Voltage sense divider (`10 kΩ` top / `2.7 kΩ` bottom, gain `12.7 / 2.7 ≈ 4.7037`) |
 | **16**| `VCAP` | `VCAP` | Internal Regulator | Power | LDO core supply bypass (C6 4.7µF to GND) |
 | **17**| `VDD` | `3V3` | Power Supply | Power | Digital 3.3V supply (Decoupled by C1 4.7µF, C7 100nF) |
 | **18**| `PB15`| `IN_B2` | `TIM1_CH3N` / GPIO | Motor Driver | Channel B PWM / Direction Input 2 |
@@ -52,8 +52,8 @@ Custom high-performance micro-servo controller board powered by the **STM32H503K
 | **26**| `PB3` | `SCL` | `I2C2_SCL` (AF8) | Host Comms | Host I2C Clock (BareBoot bootloader target) |
 | **27**| `PB4` | `SDA` | `I2C2_SDA` (AF8) | Host Comms | Host I2C Data (BareBoot bootloader target) |
 | **28**| `PB5` | `IN_A2` | `TIM3_CH2` / GPIO | Motor Driver | Channel A PWM / Direction Input 2 |
-| **29**| `PB6` | `3D_SCL` | `I2C1_SCL` (AF4) | Sensor Bus | 3D Magnetic Sensor I2C Clock |
-| **30**| `PB7` | `3D_SDA` | `I2C1_SDA` (AF4) | Sensor Bus | 3D Magnetic Sensor I2C Data |
+| **29**| `PB6` | `3D_SCL` | `I2C1_SCL` (AF4) | Sensor Bus | 3D Magnetic Sensor I2C Clock (2.7 kΩ external pull-up to 3.3 V) |
+| **30**| `PB7` | `3D_SDA` | `I2C1_SDA` (AF4) | Sensor Bus | 3D Magnetic Sensor I2C Data (2.7 kΩ external pull-up to 3.3 V) |
 | **31**| `BOOT0`| `BOOT` | Boot Selector | Control | Boot configuration (10 kΩ pull-down R30 to GND) |
 | **32**| `PB8` | *NC* | None (X) | Unused | Unconnected / Not bonded out |
 | **33**| `EP` | `GND` | Thermal Exposed Pad| Ground | Central thermal & ground pad to system GND |
